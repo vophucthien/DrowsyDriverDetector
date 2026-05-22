@@ -29,14 +29,15 @@ python -m pip show mediapipe
 ```
 
 The Python path should point inside `.venv`, and MediaPipe should be
-`0.10.21`.
+`0.10.20`.
 
 ## Run
 
 In VS Code, open `drowsy_detection.py` and click **Run Python File**.
 
-The app opens a camera picker, then starts the detector after you choose a
-source. This is the main workflow.
+The terminal shows two startup options: use the default built-in camera (`0`),
+or scan for available cameras and choose from the detected list. This is the
+main workflow.
 
 Terminal equivalent:
 
@@ -45,9 +46,11 @@ source .venv/bin/activate
 python drowsy_detection.py
 ```
 
-The picker scans camera indexes `0` through `4` by default and lets you choose
-one from a dropdown. Command-line inputs are still supported for testing and
-recorded videos.
+The scanner checks camera indexes `0` through `4` by default and shows each
+OpenCV index with its detected resolution. After you quit with `q`, the app can
+save a local label for the camera index you actually used, using camera names
+detected at startup or a custom label. Command-line inputs are still supported
+for testing and recorded videos.
 
 Webcam without picker:
 
@@ -76,8 +79,11 @@ python drowsy_detection.py --input http://camera-url/video
 
 Press `q` in the OpenCV window to quit.
 
-When the run exits, the app prints an average per-stage performance report and
-exports `pipeline_performance_benchmark.png` with the pipeline bottleneck chart.
+When the run exits, the app prints the current run's per-stage performance
+report, appends the run to `pipeline_performance_log.csv`, prints a table of
+all recorded runs plus the average row, and exports
+`pipeline_performance_benchmark.png` with the latest bottleneck chart. The log
+table is local; delete that CSV when you want to reset the recorded history.
 
 ## Useful Options
 
@@ -99,10 +105,16 @@ Run without an OpenCV preview window:
 python drowsy_detection.py --input test_video.mp4 --no-display --no-audio
 ```
 
-Scan more camera indexes in the picker:
+Scan more camera indexes when using startup option 2:
 
 ```bash
 python drowsy_detection.py --camera-scan-limit 8
+```
+
+Show low-level MediaPipe/TFLite diagnostics while debugging:
+
+```bash
+python drowsy_detection.py --input 0 --native-logs
 ```
 
 Calibrate a personal threshold from your open eyes:
@@ -145,7 +157,8 @@ python drowsy_detection.py
 `module 'mediapipe' has no attribute 'solutions'`
 
 Recreate `.venv` with Python 3.12 and reinstall `requirements.txt`. The project
-pins `mediapipe==0.10.21` because the code uses the legacy FaceMesh API.
+pins MediaPipe to a tested 0.10.x version because the code uses the legacy
+FaceMesh API.
 
 `CoreAudio error`
 
@@ -155,9 +168,13 @@ device. You can also pass `--no-audio`.
 Slow launch or repeated `Matplotlib is building the font cache`
 
 MediaPipe imports Matplotlib internally. The app writes Matplotlib cache files
-to `.cache/matplotlib` inside this project so the cache can be reused instead
-of rebuilt every launch. If startup is still very slow, make sure you are
-running the latest script from this repo and that `.cache/` is writable.
+to `.cache/` inside this project so the cache can be reused instead of rebuilt
+every launch. If startup is still very slow, make sure you are running the
+latest script from this repo and that `.cache/` is writable.
+
+Low-level MediaPipe/TFLite startup logs are hidden by default so normal runs
+show only the app's own status and benchmark output. Use `--native-logs` if you
+need those diagnostics while debugging.
 
 Also avoid having both `opencv-python` and `opencv-contrib-python` installed in
 the same virtual environment. MediaPipe depends on `opencv-contrib-python`, and

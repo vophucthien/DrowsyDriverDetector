@@ -5,5 +5,7 @@ __pycache__/
 *.pyc
 .DS_Store
 .cache/
+.camera_aliases.json
+pipeline_performance_log.csv
 drowsiness_result.jpg
 test_video.mp4
