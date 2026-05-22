@@ -6,11 +6,11 @@ import sys
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-EAR_THRESHOLD = 0.22   # below this → eye considered closed/drowsy
-CONSEC_FRAMES = 15     # consecutive drowsy frames before alarm (~0.5s @ 30fps)
+EAR_THRESHOLD = 0.22   # Dưới ngưỡng này → Mắt được coi là nhắm / buồn ngủ
+CONSEC_FRAMES = 15     # Số lượng khung hình nhắm mắt liên tiếp để báo động
 APP_CACHE_DIR = os.path.join(os.path.dirname(__file__), ".cache")
 
-# Mediapipe FaceMesh 6-point EAR indices (Soukupová & Čech, 2016)
+# Các chỉ số điểm mốc (Indices) 6 điểm của mắt trong Mediapipe FaceMesh
 MP_LEFT_EYE  = [33,  160, 158, 133, 153, 144]
 MP_RIGHT_EYE = [362, 385, 387, 263, 373, 380]
 
@@ -48,7 +48,7 @@ def make_beep(pygame, freq=880, duration=0.5, rate=44100):
 
 
 class SilentAlarm:
-    """Fallback alarm used when the audio device or pygame mixer is unavailable."""
+    """Còi báo động dự phòng khi thiết bị âm thanh không khả dụng."""
 
     def play(self, *args, **kwargs):
         return None
@@ -71,7 +71,7 @@ def init_alarm(enabled=True):
         return SilentAlarm(), False
 
 
-# ── Overlay ───────────────────────────────────────────────────────────────────
+# ── Overlay (Giao diện văn bản hiển thị trên Camera) ───────────────────────────
 
 def draw_overlay(frame, ear, drowsy, frame_counter, timings, threshold, frame_limit,
                  calibrating=False):
@@ -121,8 +121,7 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
     if not hasattr(mp, "solutions"):
         raise RuntimeError(
             "This script requires the MediaPipe legacy solutions API. "
-            "Recreate the virtual environment with Python 3.12 and install "
-            "requirements.txt so mediapipe==0.10.21 is used."
+            "Please check your virtual environment setup."
         )
 
     try:
@@ -134,9 +133,7 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
         )
     except RuntimeError as exc:
         raise RuntimeError(
-            "MediaPipe FaceMesh could not start. On macOS this can happen when "
-            "Python cannot create an OpenGL context, such as from a restricted "
-            "IDE/sandbox. Try running the command from a normal Terminal window."
+            "MediaPipe FaceMesh could not start. Please check camera or OpenGL context."
         ) from exc
     print("[INFO] MediaPipe FaceMesh ready")
 
@@ -146,7 +143,7 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
     current_threshold = ear_threshold
     is_calibrating = calibrate
 
-    # Initialize data store list for performance monitoring metrics
+    # Khởi tạo mảng lưu trữ dữ liệu thời gian của từng khung hình
     all_timings_data = []
 
     try:
@@ -158,17 +155,17 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
             fh, fw = frame.shape[:2]
             timings = {}
 
-            # ① Grayscale
+            # ① Tiền xử lý: Ảnh xám
             t = time.perf_counter()
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             timings["1. Grayscale"] = (time.perf_counter() - t) * 1000
 
-            # ② Gaussian blur
+            # ② Tiền xử lý: Làm mờ Gaussian
             t = time.perf_counter()
             blurred = cv2.GaussianBlur(gray, (5, 5), 0)
             timings["2. Gaussian Blur"] = (time.perf_counter() - t) * 1000
 
-            # ③ Haar face detection
+            # ③ Thuật toán Haar phát hiện khuôn mặt
             t = time.perf_counter()
             faces = face_cascade.detectMultiScale(
                 blurred, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80)
@@ -178,7 +175,7 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
                 cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 200, 0), 2)
             timings["3. Face Detection"] = (time.perf_counter() - t) * 1000
 
-            # ④ Eye ROI crop (geometric)
+            # ④ Cắt vùng ROI mắt (dựa trên hình học học không gian mặt)
             t = time.perf_counter()
             if len(faces):
                 x, y, w, h = max(faces, key=lambda r: r[2] * r[3])
@@ -187,7 +184,7 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
                 cv2.rectangle(frame, (x, ey1), (x + w, ey2), (0, 165, 255), 1)
             timings["4. Eye ROI Crop"] = (time.perf_counter() - t) * 1000
 
-            # ⑤ Mediapipe FaceMesh → EAR thực sự
+            # ⑤ Chạy mạng nơ-ron MediaPipe FaceMesh để lấy 468 mốc + tính EAR
             t = time.perf_counter()
             ear = 0.0
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -202,7 +199,7 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
                     cv2.circle(frame, tuple(p), 2, (0, 255, 100), -1)
             timings["5. Landmark + EAR"] = (time.perf_counter() - t) * 1000
 
-            # ⑥ Decision & alert
+            # ⑥ Logic đưa ra quyết định & Kích hoạt chuông còi
             t = time.perf_counter()
             drowsy = False
             if is_calibrating:
@@ -236,7 +233,7 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
                     alarm_on = False
             timings["6. Decision & Alert"] = (time.perf_counter() - t) * 1000
 
-            # Append a copy of the recorded frame dictionary metrics to the data list
+            # Lưu đè dữ liệu của frame hiện tại vào danh sách tổng hợp
             all_timings_data.append(timings.copy())
 
             draw_overlay(
@@ -253,18 +250,18 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
         if alarm_on:
             alarm.stop()
 
-        # ── AUTOMATIC PERFORMANCE REPORTING & PLOTTING SYSTEM ──────────────────
+        # ── HỆ THỐNG TỰ ĐỘNG XUẤT BÁO CÁO VÀ VẼ PIE CHART CHUYÊN NGHIỆP ──────────
         if all_timings_data:
             import pandas as pd
             import matplotlib.pyplot as plt
 
-            # 1. Process timing statistics with Pandas DataFrame
+            # 1. Xử lý tính toán thống kê bằng thư viện Pandas DataFrame
             df = pd.DataFrame(all_timings_data)
             mean_timings = df.mean()
             total_mean_latency = mean_timings.sum()
             mean_fps = 1000.0 / total_mean_latency if total_mean_latency > 0 else 0
 
-            # Print an elegant markdown text summary in the console terminal
+            # In bảng báo cáo hiệu suất dạng text siêu đẹp ra Terminal Console
             print("\n" + "="*55)
             print("         PIPELINE PERFORMANCE BENCHMARK REPORT          ")
             print("="*55)
@@ -276,33 +273,51 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
             print(f"Average System Throughput: {mean_fps:.1f} FPS")
             print("="*55)
 
-            # 2. Build horizontal bar graph visualization for pipeline bottleneck evaluation
+            # 2. Xây dựng cấu trúc biểu đồ bánh Pie Chart chuyên nghiệp
             try:
-                plt.figure(figsize=(10, 5))
+                plt.figure(figsize=(9, 7))  # Mở rộng chiều ngang để đặt bảng chú thích
                 stages = list(mean_timings.index)
                 latencies = list(mean_timings.values)
                 
-                # Dark slate aesthetic palette
-                colors = ['#ced4da', '#adb5bd', '#6c757d', '#495057', '#0077b6', '#00b4d8']
-                bars = plt.barh(stages, latencies, color=colors[:len(stages)])
-                
-                # Append millisecond latency labels directly outside structural data bars
-                for bar in bars:
-                    width = bar.get_width()
-                    plt.text(width + 0.2, bar.get_y() + bar.get_height()/2, 
-                             f'{width:.2f} ms', 
-                             va='center', ha='left', fontsize=10, fontweight='bold')
+                # Loại bỏ các stage siêu nhỏ để tránh dính nhãn đè chữ thô kệch
+                filtered_stages = [s for s, l in zip(stages, latencies) if l > 0.05]
+                filtered_latencies = [l for l in latencies if l > 0.05]
 
-                plt.title(f"Pipeline Bottleneck Analysis (Avg Total: {total_mean_latency:.1f} ms | ~{mean_fps:.1f} FPS)", 
-                          fontsize=12, fontweight='bold', pad=15)
-                plt.xlabel("Latency (milliseconds)", fontsize=10)
-                plt.gca().invert_yaxis()  # Keeps Stage 1 execution layout on top row
+                # Bảng màu thương mại cao cấp, độ tương phản rõ rệt
+                colors = ['#3498db', '#e67e22', '#2ecc71', '#e74c3c', '#9b59b6', '#1abc9c']
+                
+                # Hiệu ứng tách miếng độc lập (Explode) cho điểm nghẽn lớn nhất (Stage 3)
+                explode = [0.08 if "3. Face Detection" in s else 0 for s in filtered_stages]
+
+                # Vẽ biểu đồ: Chỉ giữ số phần trăm trắng tinh bên trong miếng bánh
+                wedges, texts, autotexts = plt.pie(
+                    filtered_latencies, 
+                    autopct='%1.1f%%', 
+                    startangle=140, 
+                    colors=colors[:len(filtered_latencies)],
+                    explode=explode,
+                    shadow=True,
+                    textprops={'fontsize': 11, 'fontweight': 'bold', 'color': 'white'}
+                )
+
+                # Rút toàn bộ nhãn văn bản chữ ra một hộp Legend gọn gàng bên tay phải
+                plt.legend(
+                    wedges, 
+                    filtered_stages,
+                    title="Pipeline Stages",
+                    loc="center left",
+                    bbox_to_anchor=(1, 0, 0.5, 1),
+                    fontsize=10
+                )
+
+                plt.title(f"Pipeline Bottleneck Distribution Analysis\n(Avg Total: {total_mean_latency:.1f} ms | ~{mean_fps:.1f} FPS)", 
+                          fontsize=13, fontweight='bold', pad=20)
                 plt.tight_layout()
                 
-                # Export the diagnostic visualization asset directly into project directory
+                # Xuất và ghi đè file ảnh báo cáo chất lượng cao vào thư mục
                 report_path = "pipeline_performance_benchmark.png"
-                plt.savefig(report_path, dpi=300)
-                print(f"[INFO] Performance chart successfully generated and exported as '{report_path}'!")
+                plt.savefig(report_path, dpi=300, bbox_inches='tight')
+                print(f"[INFO] Beautiful pie chart successfully generated and exported as '{report_path}'!")
             except Exception as e:
                 print(f"[WARN] Error compiling system performance chart output: {e}")
 
