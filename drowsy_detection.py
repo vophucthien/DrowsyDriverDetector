@@ -40,6 +40,7 @@ def configure_runtime_cache():
     matplotlib_dir = os.path.join(APP_CACHE_DIR, "matplotlib")
     os.makedirs(matplotlib_dir, exist_ok=True)
     os.environ.setdefault("MPLCONFIGDIR", matplotlib_dir)
+    os.environ.setdefault("MPLBACKEND", "Agg")
 
 
 def load_face_mesh_class():
@@ -403,13 +404,13 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
 
         # ── AUTOMATIC PERFORMANCE REPORTING & PLOTTING SYSTEM ──────────────────
         if all_timings_data:
-            import pandas as pd
-            import matplotlib.pyplot as plt
-
-            # 1. Process timing statistics with Pandas DataFrame
-            df = pd.DataFrame(all_timings_data)
-            mean_timings = df.mean()
-            total_mean_latency = mean_timings.sum()
+            # 1. Process timing statistics from all completed frames.
+            stage_names = list(all_timings_data[0])
+            mean_timings = {
+                stage: sum(row.get(stage, 0.0) for row in all_timings_data) / len(all_timings_data)
+                for stage in stage_names
+            }
+            total_mean_latency = sum(mean_timings.values())
             mean_fps = 1000.0 / total_mean_latency if total_mean_latency > 0 else 0
 
             # Print an elegant markdown text summary in the console terminal
@@ -426,30 +427,57 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
 
             # 2. Build horizontal bar graph visualization for pipeline bottleneck evaluation
             try:
-                plt.figure(figsize=(10, 5))
-                stages = list(mean_timings.index)
-                latencies = list(mean_timings.values)
-                
-                # Dark slate aesthetic palette
-                colors = ['#ced4da', '#adb5bd', '#6c757d', '#495057', '#0077b6', '#00b4d8']
-                bars = plt.barh(stages, latencies, color=colors[:len(stages)])
-                
-                # Append millisecond latency labels directly outside structural data bars
-                for bar in bars:
-                    width = bar.get_width()
-                    plt.text(width + 0.2, bar.get_y() + bar.get_height()/2, 
-                             f'{width:.2f} ms', 
-                             va='center', ha='left', fontsize=10, fontweight='bold')
+                stages = list(mean_timings)
+                latencies = list(mean_timings.values())
+                max_latency = max(latencies) if latencies else 1.0
+                row_h = 58
+                width = 1200
+                height = 115 + row_h * len(stages)
+                label_w = 285
+                bar_w = 760
+                chart = np.full((height, width, 3), 255, dtype=np.uint8)
+                colors = [
+                    (218, 212, 206), (189, 181, 173), (125, 117, 108),
+                    (87, 80, 73), (182, 119, 0), (216, 180, 0)
+                ]
 
-                plt.title(f"Pipeline Bottleneck Analysis (Avg Total: {total_mean_latency:.1f} ms | ~{mean_fps:.1f} FPS)", 
-                          fontsize=12, fontweight='bold', pad=15)
-                plt.xlabel("Latency (milliseconds)", fontsize=10)
-                plt.gca().invert_yaxis()  # Keeps Stage 1 execution layout on top row
-                plt.tight_layout()
-                
-                # Export the diagnostic visualization asset directly into project directory
-                report_path = "pipeline_performance_benchmark.png"
-                plt.savefig(report_path, dpi=300)
+                cv2.putText(
+                    chart,
+                    f"Pipeline Bottleneck Analysis | Avg Total: {total_mean_latency:.1f} ms | ~{mean_fps:.1f} FPS",
+                    (32, 42),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.82,
+                    (30, 30, 30),
+                    2,
+                    cv2.LINE_AA,
+                )
+                cv2.putText(
+                    chart,
+                    "Latency (milliseconds)",
+                    (label_w, 82),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.58,
+                    (90, 90, 90),
+                    1,
+                    cv2.LINE_AA,
+                )
+
+                for i, (stage, latency) in enumerate(zip(stages, latencies)):
+                    y = 112 + i * row_h
+                    color = colors[i % len(colors)]
+                    scaled_w = int((latency / max_latency) * bar_w) if max_latency > 0 else 0
+                    cv2.putText(
+                        chart, stage, (32, y + 22), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.56, (45, 45, 45), 1, cv2.LINE_AA
+                    )
+                    cv2.rectangle(chart, (label_w, y), (label_w + scaled_w, y + 30), color, -1)
+                    cv2.putText(
+                        chart, f"{latency:.2f} ms", (label_w + scaled_w + 12, y + 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (35, 35, 35), 1, cv2.LINE_AA
+                    )
+
+                report_path = os.path.join(os.path.dirname(__file__), "pipeline_performance_benchmark.png")
+                cv2.imwrite(report_path, chart)
                 print(f"[INFO] Performance chart successfully generated and exported as '{report_path}'!")
             except Exception as e:
                 print(f"[WARN] Error compiling system performance chart output: {e}")

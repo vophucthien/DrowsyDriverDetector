@@ -76,6 +76,9 @@ python drowsy_detection.py --input http://camera-url/video
 
 Press `q` in the OpenCV window to quit.
 
+When the run exits, the app prints an average per-stage performance report and
+exports `pipeline_performance_benchmark.png` with the pipeline bottleneck chart.
+
 ## Useful Options
 
 Tune the EAR threshold and closed-frame count:
