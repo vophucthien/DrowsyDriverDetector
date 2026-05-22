@@ -2,6 +2,9 @@ import os
 import time
 import argparse
 import sys
+import importlib.util
+import types
+from contextlib import contextmanager
 
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
@@ -37,6 +40,157 @@ def configure_runtime_cache():
     matplotlib_dir = os.path.join(APP_CACHE_DIR, "matplotlib")
     os.makedirs(matplotlib_dir, exist_ok=True)
     os.environ.setdefault("MPLCONFIGDIR", matplotlib_dir)
+
+
+def load_face_mesh_class():
+    """Load MediaPipe FaceMesh without importing the unused mediapipe.tasks stack."""
+    spec = importlib.util.find_spec("mediapipe")
+    if spec is None or not spec.submodule_search_locations:
+        raise RuntimeError("MediaPipe is not installed in this Python environment.")
+
+    root = next(iter(spec.submodule_search_locations))
+    if "mediapipe" not in sys.modules:
+        mediapipe_pkg = types.ModuleType("mediapipe")
+        mediapipe_pkg.__path__ = [root]
+        mediapipe_pkg.__package__ = "mediapipe"
+        sys.modules["mediapipe"] = mediapipe_pkg
+
+    try:
+        from mediapipe.python.solutions.face_mesh import FaceMesh
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not load MediaPipe FaceMesh. Recreate the virtual environment "
+            "with Python 3.12 and install requirements.txt."
+        ) from exc
+
+    return FaceMesh
+
+
+@contextmanager
+def suppress_native_stderr():
+    saved_stderr_fd = os.dup(2)
+    try:
+        with open(os.devnull, "w") as devnull:
+            os.dup2(devnull.fileno(), 2)
+            yield
+    finally:
+        os.dup2(saved_stderr_fd, 2)
+        os.close(saved_stderr_fd)
+
+
+def find_camera_sources(cv2, scan_limit=5):
+    sources = []
+    for index in range(scan_limit):
+        cap = None
+        try:
+            with suppress_native_stderr():
+                cap = cv2.VideoCapture(index)
+                if not cap.isOpened():
+                    continue
+
+                ok, frame = cap.read()
+            label = f"Camera {index}"
+            if ok and frame is not None:
+                h, w = frame.shape[:2]
+                label = f"Camera {index} ({w}x{h})"
+            sources.append((str(index), label))
+        finally:
+            if cap is not None:
+                cap.release()
+
+    if not sources:
+        sources.append(("0", "Camera 0"))
+    return sources
+
+
+def choose_video_source(cv2, scan_limit=5):
+    try:
+        import tkinter as tk
+        from tkinter import messagebox, ttk
+    except Exception as exc:
+        print(f"[WARN] Camera picker unavailable: {exc}; using camera 0")
+        return "0"
+
+    cameras = find_camera_sources(cv2, scan_limit=scan_limit)
+    source_by_label = {label: source for source, label in cameras}
+    custom_label = "Other video source..."
+    selected = {"source": None}
+
+    root = tk.Tk()
+    root.title("Select Camera")
+    root.resizable(False, False)
+    root.columnconfigure(0, weight=1)
+
+    ttk.Label(root, text="Camera source").grid(
+        row=0, column=0, columnspan=2, padx=16, pady=(16, 6), sticky="w"
+    )
+
+    source_box = ttk.Combobox(
+        root,
+        values=[label for _, label in cameras] + [custom_label],
+        state="readonly",
+        width=36,
+    )
+    source_box.current(0)
+    source_box.grid(row=1, column=0, columnspan=2, padx=16, sticky="ew")
+
+    ttk.Label(root, text="Custom path, URL, or camera index").grid(
+        row=2, column=0, columnspan=2, padx=16, pady=(12, 6), sticky="w"
+    )
+
+    custom_entry = ttk.Entry(root, width=38)
+    custom_entry.insert(0, "0")
+    custom_entry.state(["disabled"])
+    custom_entry.grid(row=3, column=0, columnspan=2, padx=16, sticky="ew")
+
+    def on_source_change(_event=None):
+        if source_box.get() == custom_label:
+            custom_entry.state(["!disabled"])
+            custom_entry.focus_set()
+            custom_entry.selection_range(0, tk.END)
+        else:
+            custom_entry.state(["disabled"])
+
+    def start():
+        if source_box.get() == custom_label:
+            value = custom_entry.get().strip()
+        else:
+            value = source_by_label[source_box.get()]
+
+        if not value:
+            messagebox.showerror("Missing Source", "Choose a camera or enter a source.")
+            return
+
+        selected["source"] = value
+        root.destroy()
+
+    def cancel():
+        selected["source"] = None
+        root.destroy()
+
+    source_box.bind("<<ComboboxSelected>>", on_source_change)
+    root.bind("<Return>", lambda _event: start())
+    root.bind("<Escape>", lambda _event: cancel())
+    root.protocol("WM_DELETE_WINDOW", cancel)
+
+    ttk.Button(root, text="Cancel", command=cancel).grid(
+        row=4, column=0, padx=(16, 6), pady=16, sticky="ew"
+    )
+    ttk.Button(root, text="Start", command=start).grid(
+        row=4, column=1, padx=(6, 16), pady=16, sticky="ew"
+    )
+
+    root.update_idletasks()
+    width = root.winfo_width()
+    height = root.winfo_height()
+    x = (root.winfo_screenwidth() - width) // 2
+    y = (root.winfo_screenheight() - height) // 2
+    root.geometry(f"{width}x{height}+{x}+{y}")
+    root.mainloop()
+
+    if selected["source"] is None:
+        sys.exit("[INFO] Camera selection cancelled.")
+    return selected["source"]
 
 
 def make_beep(pygame, freq=880, duration=0.5, rate=44100):
@@ -117,16 +271,10 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
     import numpy as np
 
     print("[INFO] Loading MediaPipe FaceMesh...")
-    import mediapipe as mp
-    if not hasattr(mp, "solutions"):
-        raise RuntimeError(
-            "This script requires the MediaPipe legacy solutions API. "
-            "Recreate the virtual environment with Python 3.12 and install "
-            "requirements.txt so mediapipe==0.10.21 is used."
-        )
+    FaceMesh = load_face_mesh_class()
 
     try:
-        face_mesh = mp.solutions.face_mesh.FaceMesh(
+        face_mesh = FaceMesh(
             max_num_faces=1,
             refine_landmarks=True,
             min_detection_confidence=0.5,
@@ -313,8 +461,11 @@ def main():
     configure_runtime_cache()
 
     ap = argparse.ArgumentParser(description="Drowsy Driver Detection — CV Group 10")
-    ap.add_argument("--input", default="0",
-                    help="Video source: '0' = webcam, path to .mp4, or IP-camera URL")
+    ap.add_argument("--input", default=None,
+                    help="Video source: '0' = webcam, path to .mp4, or IP-camera URL. "
+                         "If omitted, a camera picker opens.")
+    ap.add_argument("--camera-scan-limit", type=int, default=5,
+                    help="Number of camera indexes to scan for the picker (default: 5)")
     ap.add_argument("--ear-threshold", type=float, default=EAR_THRESHOLD,
                     help=f"EAR value below which eyes count as closed (default: {EAR_THRESHOLD})")
     ap.add_argument("--frames", type=int, default=CONSEC_FRAMES,
@@ -338,10 +489,20 @@ def main():
         sys.exit("[ERROR] --calibration-seconds must be greater than 0")
     if args.calibration_ratio <= 0:
         sys.exit("[ERROR] --calibration-ratio must be greater than 0")
-
-    source = parse_video_source(args.input)
+    if args.camera_scan_limit < 1:
+        sys.exit("[ERROR] --camera-scan-limit must be at least 1")
 
     import cv2
+
+    input_value = args.input
+    if input_value is None:
+        if args.no_display:
+            input_value = "0"
+            print("[INFO] No --input provided with --no-display; using camera 0")
+        else:
+            input_value = choose_video_source(cv2, scan_limit=args.camera_scan_limit)
+
+    source = parse_video_source(input_value)
 
     print("[INFO] Initializing alarm...")
     alarm, audio_enabled = init_alarm(enabled=not args.no_audio)
