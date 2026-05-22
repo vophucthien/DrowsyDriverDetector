@@ -1,0 +1,12 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Drowsy Detector",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/drowsy_detection.py",
+      "console": "integratedTerminal"
+    }
+  ]
+}

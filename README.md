@@ -33,10 +33,25 @@ The Python path should point inside `.venv`, and MediaPipe should be
 
 ## Run
 
-Webcam:
+In VS Code, open `drowsy_detection.py` and click **Run Python File**.
+
+The app opens a camera picker, then starts the detector after you choose a
+source. This is the main workflow.
+
+Terminal equivalent:
 
 ```bash
 source .venv/bin/activate
+python drowsy_detection.py
+```
+
+The picker scans camera indexes `0` through `4` by default and lets you choose
+one from a dropdown. Command-line inputs are still supported for testing and
+recorded videos.
+
+Webcam without picker:
+
+```bash
 python drowsy_detection.py --input 0
 ```
 
@@ -81,6 +96,12 @@ Run without an OpenCV preview window:
 python drowsy_detection.py --input test_video.mp4 --no-display --no-audio
 ```
 
+Scan more camera indexes in the picker:
+
+```bash
+python drowsy_detection.py --camera-scan-limit 8
+```
+
 Calibrate a personal threshold from your open eyes:
 
 ```bash
@@ -105,11 +126,17 @@ python drowsy_detection.py --input 0 --calibrate --calibration-seconds 6 --calib
 `ModuleNotFoundError: No module named 'pygame'`
 
 You are probably running global Python instead of the project virtual
-environment. Run:
+environment. In VS Code, run **Python: Select Interpreter** and choose:
+
+```text
+/Users/ben/Documents/GitHub/DrowsyDriverDetector/.venv/bin/python
+```
+
+Then click **Run Python File** again. Terminal equivalent:
 
 ```bash
 source .venv/bin/activate
-python drowsy_detection.py --input 0
+python drowsy_detection.py
 ```
 
 `module 'mediapipe' has no attribute 'solutions'`
