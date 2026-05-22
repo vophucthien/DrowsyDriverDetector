@@ -75,7 +75,10 @@ python record_test.py
 python drowsy_detection.py --input test_video.mp4
 ```
 
-`record_test.py` records camera `0` to `test_video.mp4` for 20 seconds. It
+`record_test.py` opens a preview first and waits until you press `s` or Space.
+It then records camera `0` to a clean `test_video.mp4` for 20 seconds at a
+fixed 30 FPS timeline. The preview shows a large open-eye / closed-eye phase
+overlay with audio cues, but that overlay is not burned into the saved MP4. It
 overwrites the previous test video and can be stopped early with `q`.
 
 IP camera:
@@ -98,6 +101,8 @@ report, appends the run to `pipeline_performance_log.csv`, prints a table of
 all recorded runs plus the average row, and exports
 `pipeline_performance_benchmark.png` with the latest bottleneck chart. The log
 table is local; delete that CSV when you want to reset the recorded history.
+Alarm start/stop transitions are appended to `alarm_events_log.csv` when they
+occur.
 
 ## Useful Options
 
@@ -118,6 +123,21 @@ Run without an OpenCV preview window:
 ```bash
 python drowsy_detection.py --input test_video.mp4 --no-display --no-audio --no-calibrate
 ```
+
+Export a per-frame detector-state CSV:
+
+```bash
+python drowsy_detection.py --input test_video.mp4 --frame-log frame_state_log.csv
+```
+
+Score the 5-second-open / 3-second-closed recording made by `record_test.py`:
+
+```bash
+python drowsy_detection.py --input test_video.mp4 --no-display --no-audio --no-calibrate --eval-controlled
+```
+
+This writes `frame_state_log.csv` and `controlled_evaluation_summary.json`,
+then prints TP/FP/TN/FN, precision, recall, F1, and alarm latency.
 
 Scan more camera indexes when using startup option 2:
 
@@ -175,6 +195,10 @@ The app creates a few local files while running:
 - `.camera_aliases.json` stores camera labels you save from the scan menu.
 - `pipeline_performance_log.csv` stores per-run benchmark summaries.
 - `pipeline_performance_benchmark.png` stores the latest benchmark chart.
+- `alarm_events_log.csv` stores alarm start/stop transitions.
+- `frame_state_log.csv` stores per-frame detector state when requested or when
+  `--eval-controlled` is used.
+- `controlled_evaluation_summary.json` stores the latest controlled-clip score.
 - `test_video.mp4` is created by `record_test.py`.
 
 These files are ignored by git.

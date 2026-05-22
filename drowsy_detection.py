@@ -21,8 +21,14 @@ FACEMESH_ROI_MARGIN_RATIO = 0.20  # expand Haar face box before FaceMesh crop
 APP_CACHE_DIR = os.path.join(os.path.dirname(__file__), ".cache")
 CAMERA_ALIASES_FILE = os.path.join(os.path.dirname(__file__), ".camera_aliases.json")
 PERFORMANCE_LOG_FILE = os.path.join(os.path.dirname(__file__), "pipeline_performance_log.csv")
+FRAME_LOG_FILE = os.path.join(os.path.dirname(__file__), "frame_state_log.csv")
+ALARM_EVENT_LOG_FILE = os.path.join(os.path.dirname(__file__), "alarm_events_log.csv")
+CONTROLLED_EVAL_FILE = os.path.join(os.path.dirname(__file__), "controlled_evaluation_summary.json")
+CONTROLLED_OPEN_SECONDS = 5.0
+CONTROLLED_CLOSED_SECONDS = 3.0
+CONTROLLED_EXPECTED_SECONDS = 20.0
 
-# Mediapipe FaceMesh 6-point EAR indices (Soukupová & Čech, 2016)
+# MediaPipe FaceMesh 6-point EAR indices (Soukupova and Cech, 2016)
 MP_LEFT_EYE  = [33,  160, 158, 133, 153, 144]
 MP_RIGHT_EYE = [362, 385, 387, 263, 373, 380]
 
@@ -56,6 +62,26 @@ def expand_box(box, frame_width, frame_height, margin_ratio):
     if x2 <= x1 or y2 <= y1:
         return None
     return x1, y1, x2, y2
+
+
+def bool_field(value):
+    return "1" if value else "0"
+
+
+def safe_float(value, default=0.0):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return default
+    if value != value or value < 0:
+        return default
+    return value
+
+
+def ensure_parent_dir(path):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
 
 
 def configure_runtime_cache():
@@ -154,6 +180,188 @@ def write_performance_log(fieldnames, rows):
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
+
+
+def write_csv_rows(path, fieldnames, rows):
+    if not path or not rows:
+        return
+    try:
+        ensure_parent_dir(path)
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+    except OSError as exc:
+        print(f"[WARN] Could not write CSV log '{path}': {exc}")
+
+
+def append_csv_rows(path, fieldnames, rows):
+    if not path or not rows:
+        return
+    try:
+        ensure_parent_dir(path)
+        needs_header = not os.path.exists(path) or os.path.getsize(path) == 0
+        with open(path, "a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            if needs_header:
+                writer.writeheader()
+            writer.writerows(rows)
+    except OSError as exc:
+        print(f"[WARN] Could not append CSV log '{path}': {exc}")
+
+
+def write_json(path, data):
+    if not path:
+        return
+    try:
+        ensure_parent_dir(path)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.write("\n")
+    except OSError as exc:
+        print(f"[WARN] Could not write JSON file '{path}': {exc}")
+
+
+def ordered_fieldnames(rows):
+    fieldnames = []
+    for row in rows:
+        for field in row:
+            if field not in fieldnames:
+                fieldnames.append(field)
+    return fieldnames
+
+
+def controlled_ground_truth(time_seconds, open_seconds, closed_seconds):
+    cycle_seconds = open_seconds + closed_seconds
+    if cycle_seconds <= 0:
+        return "open"
+    cycle_position = time_seconds % cycle_seconds
+    return "closed" if cycle_position >= open_seconds else "open"
+
+
+def calculate_controlled_evaluation(frame_rows, open_seconds, closed_seconds):
+    counts = {"tp": 0, "fp": 0, "tn": 0, "fn": 0}
+    closed_segment_starts = {}
+    detected_segment_times = {}
+    cycle_seconds = open_seconds + closed_seconds
+
+    for row in frame_rows:
+        try:
+            time_seconds = float(row.get("time_seconds", ""))
+        except (TypeError, ValueError):
+            continue
+
+        truth = controlled_ground_truth(time_seconds, open_seconds, closed_seconds)
+        predicted_closed = row.get("drowsy") == "1"
+        actual_closed = truth == "closed"
+
+        if actual_closed and predicted_closed:
+            counts["tp"] += 1
+        elif actual_closed:
+            counts["fn"] += 1
+        elif predicted_closed:
+            counts["fp"] += 1
+        else:
+            counts["tn"] += 1
+
+        if actual_closed and cycle_seconds > 0:
+            segment_index = int(time_seconds // cycle_seconds)
+            segment_start = segment_index * cycle_seconds + open_seconds
+            closed_segment_starts.setdefault(str(segment_index), segment_start)
+            if predicted_closed:
+                detected_segment_times.setdefault(str(segment_index), time_seconds)
+
+    precision_denominator = counts["tp"] + counts["fp"]
+    recall_denominator = counts["tp"] + counts["fn"]
+    precision = counts["tp"] / precision_denominator if precision_denominator else 0.0
+    recall = counts["tp"] / recall_denominator if recall_denominator else 0.0
+    f1_denominator = precision + recall
+    f1 = (2.0 * precision * recall / f1_denominator) if f1_denominator else 0.0
+
+    latencies = []
+    for segment_index, segment_start in closed_segment_starts.items():
+        detected_at = detected_segment_times.get(segment_index)
+        if detected_at is not None:
+            latencies.append(detected_at - segment_start)
+
+    return {
+        "schedule": {
+            "open_seconds": open_seconds,
+            "closed_seconds": closed_seconds,
+            "cycle_seconds": cycle_seconds,
+        },
+        "frames_evaluated": sum(counts.values()),
+        "counts": counts,
+        "metrics": {
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+        },
+        "detection_latency_seconds": {
+            "detected_closed_segments": len(latencies),
+            "total_closed_segments": len(closed_segment_starts),
+            "mean": sum(latencies) / len(latencies) if latencies else None,
+            "min": min(latencies) if latencies else None,
+            "max": max(latencies) if latencies else None,
+            "values": latencies,
+        },
+    }
+
+
+def print_controlled_evaluation(summary, output_path=None):
+    counts = summary["counts"]
+    metrics = summary["metrics"]
+    latency = summary["detection_latency_seconds"]
+
+    print("\n" + "=" * 55)
+    print("         CONTROLLED CLIP EVALUATION REPORT          ")
+    print("=" * 55)
+    print(
+        f"Schedule: open {summary['schedule']['open_seconds']:.2f}s, "
+        f"closed {summary['schedule']['closed_seconds']:.2f}s"
+    )
+    print(f"Frames evaluated: {summary['frames_evaluated']}")
+    print(
+        f"TP: {counts['tp']}  FP: {counts['fp']}  "
+        f"TN: {counts['tn']}  FN: {counts['fn']}"
+    )
+    print(
+        f"Precision: {metrics['precision']:.3f}  "
+        f"Recall: {metrics['recall']:.3f}  F1: {metrics['f1']:.3f}"
+    )
+    print(
+        "Closed segments detected: "
+        f"{latency['detected_closed_segments']}/{latency['total_closed_segments']}"
+    )
+    if latency["mean"] is not None:
+        print(
+            f"Detection latency: mean {latency['mean']:.3f}s, "
+            f"min {latency['min']:.3f}s, max {latency['max']:.3f}s"
+        )
+    if output_path:
+        print(f"Summary JSON: {output_path}")
+    print("=" * 55)
+
+
+def warn_if_controlled_input_is_short(cap, expected_seconds):
+    import cv2
+
+    fps = safe_float(cap.get(cv2.CAP_PROP_FPS))
+    frame_count = safe_float(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if fps <= 0 or frame_count <= 0 or expected_seconds <= 0:
+        return
+
+    duration = frame_count / fps
+    print(
+        f"[INFO] Controlled input metadata: {frame_count:.0f} frames "
+        f"at {fps:.2f} FPS ({duration:.2f}s)"
+    )
+    if duration < expected_seconds * 0.95:
+        print(
+            f"[WARN] Controlled input is shorter than the expected "
+            f"{expected_seconds:.1f}s recording. Re-run record_test.py and wait "
+            "for it to finish; the full default clip should be 600 frames at 30 FPS."
+        )
 
 
 def append_performance_log(mean_timings, frame_count, total_mean_latency, mean_fps, source_label):
@@ -670,7 +878,12 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
         calibration_seconds=5.0, calibration_ratio=0.75,
         face_gate_grace_frames=FACE_GATE_GRACE_FRAMES,
         facemesh_roi_margin=FACEMESH_ROI_MARGIN_RATIO,
-        source_label="Unknown source", quiet_native_logs=True):
+        source_label="Unknown source", quiet_native_logs=True,
+        source_fps=0.0, frame_log_path=None, alarm_event_log_path=None,
+        eval_controlled=False,
+        eval_open_seconds=CONTROLLED_OPEN_SECONDS,
+        eval_closed_seconds=CONTROLLED_CLOSED_SECONDS,
+        eval_output_path=None):
     import cv2
     import numpy as np
 
@@ -718,6 +931,35 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
     haar_face_seen = False
     haar_miss_frames = 0
     last_face_box = None
+    source_fps = safe_float(source_fps)
+    if eval_controlled and not frame_log_path:
+        frame_log_path = FRAME_LOG_FILE
+    frame_rows = []
+    alarm_event_rows = []
+    frame_index = 0
+    run_started_at = time.perf_counter()
+    alarm_event_fieldnames = [
+        "timestamp",
+        "source",
+        "event",
+        "frame",
+        "time_seconds",
+        "ear",
+        "threshold",
+        "closed_frames",
+    ]
+
+    def add_alarm_event(event, event_frame, event_time, event_ear):
+        alarm_event_rows.append({
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "source": source_label,
+            "event": event,
+            "frame": str(event_frame),
+            "time_seconds": f"{event_time:.6f}",
+            "ear": f"{event_ear:.6f}",
+            "threshold": f"{current_threshold:.6f}",
+            "closed_frames": str(frame_counter),
+        })
 
     try:
         while True:
@@ -728,6 +970,8 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
             raw_frame = frame.copy()
             fh, fw = frame.shape[:2]
             timings = {}
+            wall_seconds = time.perf_counter() - run_started_at
+            time_seconds = frame_index / source_fps if source_fps > 0 else wall_seconds
 
             # ① Grayscale
             t = time.perf_counter()
@@ -760,6 +1004,7 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
             )
             active_face_box = face_box if face_box is not None else last_face_box
             facemesh_roi = None
+            reused_face_box = face_box is None and should_run_facemesh and active_face_box is not None
             if should_run_facemesh and active_face_box is not None:
                 facemesh_roi = expand_box(active_face_box, fw, fh, facemesh_roi_margin)
             timings["3. Face Detection"] = (time.perf_counter() - t) * 1000
@@ -776,9 +1021,10 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
                 cv2.rectangle(frame, (x, ey1), (x + w, ey2), (0, 165, 255), 1)
             timings["4. Eye ROI Draw"] = (time.perf_counter() - t) * 1000
 
-            # ⑤ Mediapipe FaceMesh → EAR thực sự
+            # ⑤ MediaPipe FaceMesh and EAR
             t = time.perf_counter()
             ear = 0.0
+            landmarks_found = False
             if facemesh_roi is not None:
                 x1, y1, x2, y2 = facemesh_roi
                 roi_bgr = raw_frame[y1:y2, x1:x2]
@@ -791,6 +1037,7 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
                 else:
                     result = face_mesh.process(rgb)
                 if result.multi_face_landmarks:
+                    landmarks_found = True
                     lms = result.multi_face_landmarks[0].landmark
                     pts = np.array([
                         [int(lm.x * roi_w) + x1, int(lm.y * roi_h) + y1]
@@ -832,15 +1079,55 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
                     if not alarm_on:
                         alarm.play(-1)
                         alarm_on = True
+                        add_alarm_event("alarm_start", frame_index, time_seconds, ear)
             else:
                 frame_counter = 0
                 if alarm_on:
                     alarm.stop()
                     alarm_on = False
+                    add_alarm_event("alarm_stop", frame_index, time_seconds, ear)
             timings["6. Decision & Alert"] = (time.perf_counter() - t) * 1000
 
             # Append a copy of the recorded frame dictionary metrics to the data list
             all_timings_data.append(timings.copy())
+            if frame_log_path or eval_controlled:
+                frame_row = {
+                    "source": source_label,
+                    "frame": str(frame_index),
+                    "time_seconds": f"{time_seconds:.6f}",
+                    "wall_seconds": f"{wall_seconds:.6f}",
+                    "ear": f"{ear:.6f}",
+                    "threshold": f"{current_threshold:.6f}",
+                    "closed_frames": str(frame_counter),
+                    "drowsy": bool_field(drowsy),
+                    "alarm_on": bool_field(alarm_on),
+                    "calibrating": bool_field(is_calibrating),
+                    "face_detected": bool_field(face_box is not None),
+                    "face_gate_active": bool_field(facemesh_roi is not None),
+                    "haar_box_reused": bool_field(reused_face_box),
+                    "facemesh_ran": bool_field(facemesh_roi is not None),
+                    "landmarks_found": bool_field(landmarks_found),
+                    "haar_miss_frames": str(haar_miss_frames),
+                }
+                if facemesh_roi is not None:
+                    x1, y1, x2, y2 = facemesh_roi
+                    frame_row.update({
+                        "roi_x1": str(x1),
+                        "roi_y1": str(y1),
+                        "roi_x2": str(x2),
+                        "roi_y2": str(y2),
+                    })
+                else:
+                    frame_row.update({
+                        "roi_x1": "",
+                        "roi_y1": "",
+                        "roi_x2": "",
+                        "roi_y2": "",
+                    })
+                for stage, ms in timings.items():
+                    frame_row[performance_stage_column(stage)] = f"{ms:.6f}"
+                frame_rows.append(frame_row)
+            frame_index += 1
 
             draw_overlay(
                 frame, ear, drowsy, frame_counter, timings,
@@ -867,6 +1154,9 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
         face_mesh.close()
         if alarm_on:
             alarm.stop()
+            shutdown_time = frame_index / source_fps if source_fps > 0 else time.perf_counter() - run_started_at
+            add_alarm_event("alarm_stop_shutdown", frame_index, shutdown_time, 0.0)
+            alarm_on = False
 
         # ── AUTOMATIC PERFORMANCE REPORTING & PLOTTING SYSTEM ──────────────────
         if all_timings_data:
@@ -957,6 +1247,24 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
             except Exception as e:
                 print(f"[WARN] Error compiling system performance chart output: {e}")
 
+        if frame_rows and frame_log_path:
+            write_csv_rows(frame_log_path, ordered_fieldnames(frame_rows), frame_rows)
+            print(f"[INFO] Frame state log exported as '{frame_log_path}'")
+
+        if alarm_event_rows and alarm_event_log_path:
+            append_csv_rows(alarm_event_log_path, alarm_event_fieldnames, alarm_event_rows)
+            print(f"[INFO] Alarm event log appended as '{alarm_event_log_path}'")
+
+        if eval_controlled and frame_rows:
+            summary = calculate_controlled_evaluation(
+                frame_rows,
+                eval_open_seconds,
+                eval_closed_seconds,
+            )
+            if eval_output_path:
+                write_json(eval_output_path, summary)
+            print_controlled_evaluation(summary, eval_output_path)
+
     return quit_requested
 
 
@@ -996,6 +1304,22 @@ def main():
                     help="Threshold = median open-eye EAR times this ratio (default: 0.75)")
     ap.add_argument("--native-logs", action="store_true",
                     help="Show low-level MediaPipe/TFLite startup diagnostics")
+    ap.add_argument("--frame-log", default=None,
+                    help="Write per-frame detector state to this CSV path")
+    ap.add_argument("--alarm-log", default=ALARM_EVENT_LOG_FILE,
+                    help=f"Append alarm start/stop events to this CSV path (default: {ALARM_EVENT_LOG_FILE})")
+    ap.add_argument("--no-alarm-log", action="store_true",
+                    help="Disable alarm event CSV logging")
+    ap.add_argument("--eval-controlled", action="store_true",
+                    help="Score the run against the record_test.py open/closed schedule")
+    ap.add_argument("--eval-open-seconds", type=float, default=CONTROLLED_OPEN_SECONDS,
+                    help=f"Open-eye seconds per controlled cycle (default: {CONTROLLED_OPEN_SECONDS})")
+    ap.add_argument("--eval-closed-seconds", type=float, default=CONTROLLED_CLOSED_SECONDS,
+                    help=f"Closed-eye seconds per controlled cycle (default: {CONTROLLED_CLOSED_SECONDS})")
+    ap.add_argument("--eval-output", default=CONTROLLED_EVAL_FILE,
+                    help=f"Write controlled evaluation summary JSON here (default: {CONTROLLED_EVAL_FILE})")
+    ap.add_argument("--eval-expected-seconds", type=float, default=CONTROLLED_EXPECTED_SECONDS,
+                    help=f"Expected controlled recording duration (default: {CONTROLLED_EXPECTED_SECONDS})")
     args = ap.parse_args()
     if args.frames < 1:
         sys.exit("[ERROR] --frames must be at least 1")
@@ -1011,6 +1335,12 @@ def main():
         sys.exit("[ERROR] --face-gate-grace must be at least 0")
     if args.facemesh_roi_margin < 0:
         sys.exit("[ERROR] --facemesh-roi-margin must be at least 0")
+    if args.eval_open_seconds <= 0:
+        sys.exit("[ERROR] --eval-open-seconds must be greater than 0")
+    if args.eval_closed_seconds <= 0:
+        sys.exit("[ERROR] --eval-closed-seconds must be greater than 0")
+    if args.eval_expected_seconds <= 0:
+        sys.exit("[ERROR] --eval-expected-seconds must be greater than 0")
 
     import cv2
 
@@ -1039,6 +1369,13 @@ def main():
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
         sys.exit(f"[ERROR] Cannot open: '{source}'")
+    source_fps = safe_float(cap.get(cv2.CAP_PROP_FPS))
+    frame_log_path = args.frame_log
+    if args.eval_controlled and not frame_log_path:
+        frame_log_path = FRAME_LOG_FILE
+    alarm_event_log_path = None if args.no_alarm_log else args.alarm_log
+    if args.eval_controlled:
+        warn_if_controlled_input_is_short(cap, args.eval_expected_seconds)
 
     print("[INFO] Drowsy Driver Detection started | press 'q' to quit")
     if args.calibrate:
@@ -1060,6 +1397,13 @@ def main():
             facemesh_roi_margin=args.facemesh_roi_margin,
             source_label=describe_video_source(source),
             quiet_native_logs=not args.native_logs,
+            source_fps=source_fps,
+            frame_log_path=frame_log_path,
+            alarm_event_log_path=alarm_event_log_path,
+            eval_controlled=args.eval_controlled,
+            eval_open_seconds=args.eval_open_seconds,
+            eval_closed_seconds=args.eval_closed_seconds,
+            eval_output_path=args.eval_output,
         )
     except RuntimeError as exc:
         sys.exit(f"[ERROR] {exc}")
