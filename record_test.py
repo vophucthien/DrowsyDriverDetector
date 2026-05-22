@@ -16,7 +16,7 @@ fps = 30
 writer = cv2.VideoWriter(OUTPUT, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
 
 print(f"[INFO] Recording {DURATION}s → {OUTPUT}")
-print("[INFO] Hướng dẫn: nhìn bình thường 5s → nhắm mắt 3s → mở mắt → lặp lại")
+print("[INFO] Open your eyes for 5 seconds → Close your eyes for 3 seconds → Repeat")
 print("[INFO] Nhấn 'q' để dừng sớm")
 
 start = time.time()
@@ -30,7 +30,7 @@ while True:
 
     cv2.putText(frame, f"REC  {remaining:.1f}s remaining",
                 (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
-    cv2.putText(frame, "Mo mat 5s → Nham mat 3s → lap lai",
+    cv2.putText(frame, "Open eyes 5s -> Close eyes 3s -> Repeat",
                 (10, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
 
     writer.write(frame)

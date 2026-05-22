@@ -16,6 +16,8 @@ os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "2")
 # ── Constants ─────────────────────────────────────────────────────────────────
 EAR_THRESHOLD = 0.22   # below this → eye considered closed/drowsy
 CONSEC_FRAMES = 15     # consecutive drowsy frames before alarm (~0.5s @ 30fps)
+FACE_GATE_GRACE_FRAMES = 5  # keep FaceMesh running briefly after Haar loses face
+FACEMESH_ROI_MARGIN_RATIO = 0.20  # expand Haar face box before FaceMesh crop
 APP_CACHE_DIR = os.path.join(os.path.dirname(__file__), ".cache")
 CAMERA_ALIASES_FILE = os.path.join(os.path.dirname(__file__), ".camera_aliases.json")
 PERFORMANCE_LOG_FILE = os.path.join(os.path.dirname(__file__), "pipeline_performance_log.csv")
@@ -41,6 +43,19 @@ def parse_video_source(value: str):
         return int(value)
     except ValueError:
         return value
+
+
+def expand_box(box, frame_width, frame_height, margin_ratio):
+    x, y, w, h = [int(v) for v in box]
+    margin_x = int(w * margin_ratio)
+    margin_y = int(h * margin_ratio)
+    x1 = max(0, x - margin_x)
+    y1 = max(0, y - margin_y)
+    x2 = min(frame_width, x + w + margin_x)
+    y2 = min(frame_height, y + h + margin_y)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return x1, y1, x2, y2
 
 
 def configure_runtime_cache():
@@ -190,6 +205,7 @@ def short_stage_name(stage):
         "Gaussian Blur": "Blur",
         "Face Detection": "Face",
         "Eye ROI Crop": "ROI",
+        "Eye ROI Draw": "ROI",
         "Landmark + EAR": "EAR",
         "Decision & Alert": "Alert",
     }
@@ -582,7 +598,7 @@ def init_alarm(enabled=True):
 # ── Overlay ───────────────────────────────────────────────────────────────────
 
 def draw_overlay(frame, ear, drowsy, frame_counter, timings, threshold, frame_limit,
-                 calibrating=False):
+                 calibrating=False, calibration_elapsed=0.0, calibration_seconds=0.0):
     import cv2
 
     h, w = frame.shape[:2]
@@ -591,36 +607,69 @@ def draw_overlay(frame, ear, drowsy, frame_counter, timings, threshold, frame_li
         overlay = frame.copy()
         cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 180), -1)
         cv2.addWeighted(overlay, 0.18, frame, 0.82, 0, frame)
-        cv2.putText(frame, "! DROWSY  WAKE UP !",
-                    (w // 2 - 200, h // 2),
-                    cv2.FONT_HERSHEY_DUPLEX, 1.1, (0, 0, 255), 3)
+        alert = "! DROWSY  WAKE UP !"
+        (alert_w, _), _ = cv2.getTextSize(alert, cv2.FONT_HERSHEY_DUPLEX, 1.28, 3)
+        cv2.putText(frame, alert,
+                    (w // 2 - alert_w // 2, h // 2),
+                    cv2.FONT_HERSHEY_DUPLEX, 1.28, (0, 0, 255), 3)
 
     status_color = (0, 0, 255) if drowsy else (0, 220, 0)
     status = "Calibrating" if calibrating else ("DROWSY" if drowsy else "Awake")
     status_color = (0, 200, 255) if calibrating else status_color
     cv2.putText(frame, f"Status: {status}",
-                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.85, status_color, 2)
+                (10, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.98, status_color, 2)
     cv2.putText(frame,
                 f"EAR: {ear:.3f}   threshold: {threshold:.3f}   closed frames: {frame_counter}/{frame_limit}",
-                (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1)
+                (10, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 1)
 
-    y, total = 88, 0.0
+    y, total = 102, 0.0
     for label, ms in timings.items():
         cv2.putText(frame, f"{label}: {ms:.1f} ms",
-                    (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (170, 170, 170), 1)
-        y += 18
+                    (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (170, 170, 170), 1)
+        y += 22
         total += ms
 
     fps = 1000.0 / total if total > 0 else 0.0
     cv2.putText(frame, f"Pipeline: {total:.1f} ms  (~{fps:.1f} FPS)",
-                (10, y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 200, 50), 1)
+                (10, y + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 200, 50), 1)
+
+    if calibrating:
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.45, frame, 0.55, 0, frame)
+
+        title = "Calibrating"
+        remaining = max(0.0, calibration_seconds - calibration_elapsed)
+        details = f"Keep eyes open ({remaining:.1f}s)"
+        cancel = "C/Esc: cancel and use default EAR threshold"
+
+        title_scale = 1.58
+        title_thickness = 3
+        (title_w, _), _ = cv2.getTextSize(
+            title, cv2.FONT_HERSHEY_DUPLEX, title_scale, title_thickness
+        )
+        detail_scale = 0.72
+        cancel_scale = 0.66
+        (detail_w, _), _ = cv2.getTextSize(details, cv2.FONT_HERSHEY_SIMPLEX, detail_scale, 2)
+        (cancel_w, _), _ = cv2.getTextSize(cancel, cv2.FONT_HERSHEY_SIMPLEX, cancel_scale, 1)
+
+        cx = w // 2
+        cy = h // 2
+        cv2.putText(frame, title, (cx - title_w // 2, cy - 34),
+                    cv2.FONT_HERSHEY_DUPLEX, title_scale, (0, 220, 255), title_thickness)
+        cv2.putText(frame, details, (cx - detail_w // 2, cy + 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, detail_scale, (255, 255, 255), 2)
+        cv2.putText(frame, cancel, (cx - cancel_w // 2, cy + 54),
+                    cv2.FONT_HERSHEY_SIMPLEX, cancel_scale, (210, 210, 210), 1)
 
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 
 def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
-        consecutive_frames=CONSEC_FRAMES, display=True, calibrate=False,
+        consecutive_frames=CONSEC_FRAMES, display=True, calibrate=True,
         calibration_seconds=5.0, calibration_ratio=0.75,
+        face_gate_grace_frames=FACE_GATE_GRACE_FRAMES,
+        facemesh_roi_margin=FACEMESH_ROI_MARGIN_RATIO,
         source_label="Unknown source", quiet_native_logs=True):
     import cv2
     import numpy as np
@@ -666,6 +715,9 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
     all_timings_data = []
     quit_requested = False
     quiet_frames_remaining = 2 if quiet_native_logs else 0
+    haar_face_seen = False
+    haar_miss_frames = 0
+    last_face_box = None
 
     try:
         while True:
@@ -673,12 +725,13 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
             if not ret:
                 break
 
+            raw_frame = frame.copy()
             fh, fw = frame.shape[:2]
             timings = {}
 
             # ① Grayscale
             t = time.perf_counter()
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2GRAY)
             timings["1. Grayscale"] = (time.perf_counter() - t) * 1000
 
             # ② Gaussian blur
@@ -691,48 +744,75 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
             faces = face_cascade.detectMultiScale(
                 blurred, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80)
             )
+            face_box = None
             if len(faces):
-                x, y, w, h = max(faces, key=lambda r: r[2] * r[3])
+                face_box = max(faces, key=lambda r: r[2] * r[3])
+                x, y, w, h = face_box
                 cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 200, 0), 2)
+                haar_face_seen = True
+                haar_miss_frames = 0
+                last_face_box = face_box
+            elif haar_face_seen:
+                haar_miss_frames += 1
+            should_run_facemesh = (
+                face_box is not None
+                or (haar_face_seen and haar_miss_frames <= face_gate_grace_frames)
+            )
+            active_face_box = face_box if face_box is not None else last_face_box
+            facemesh_roi = None
+            if should_run_facemesh and active_face_box is not None:
+                facemesh_roi = expand_box(active_face_box, fw, fh, facemesh_roi_margin)
             timings["3. Face Detection"] = (time.perf_counter() - t) * 1000
 
-            # ④ Eye ROI crop (geometric)
+            # ④ Eye ROI draw (geometric visualization)
             t = time.perf_counter()
-            if len(faces):
-                x, y, w, h = max(faces, key=lambda r: r[2] * r[3])
+            if facemesh_roi is not None:
+                x1, y1, x2, y2 = facemesh_roi
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (80, 220, 255), 1)
+            if face_box is not None:
+                x, y, w, h = face_box
                 ey1 = y + int(h * 0.30)
                 ey2 = y + int(h * 0.55)
                 cv2.rectangle(frame, (x, ey1), (x + w, ey2), (0, 165, 255), 1)
-            timings["4. Eye ROI Crop"] = (time.perf_counter() - t) * 1000
+            timings["4. Eye ROI Draw"] = (time.perf_counter() - t) * 1000
 
             # ⑤ Mediapipe FaceMesh → EAR thực sự
             t = time.perf_counter()
             ear = 0.0
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            if quiet_frames_remaining > 0:
-                with suppress_native_stderr():
+            if facemesh_roi is not None:
+                x1, y1, x2, y2 = facemesh_roi
+                roi_bgr = raw_frame[y1:y2, x1:x2]
+                roi_h, roi_w = roi_bgr.shape[:2]
+                rgb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)
+                if quiet_frames_remaining > 0:
+                    with suppress_native_stderr():
+                        result = face_mesh.process(rgb)
+                    quiet_frames_remaining -= 1
+                else:
                     result = face_mesh.process(rgb)
-                quiet_frames_remaining -= 1
-            else:
-                result = face_mesh.process(rgb)
-            if result.multi_face_landmarks:
-                lms = result.multi_face_landmarks[0].landmark
-                pts = np.array([[int(lm.x * fw), int(lm.y * fh)] for lm in lms])
-                left_eye = pts[MP_LEFT_EYE]
-                right_eye = pts[MP_RIGHT_EYE]
-                ear = (eye_aspect_ratio(left_eye) + eye_aspect_ratio(right_eye)) / 2.0
-                for p in np.vstack([left_eye, right_eye]):
-                    cv2.circle(frame, tuple(p), 2, (0, 255, 100), -1)
+                if result.multi_face_landmarks:
+                    lms = result.multi_face_landmarks[0].landmark
+                    pts = np.array([
+                        [int(lm.x * roi_w) + x1, int(lm.y * roi_h) + y1]
+                        for lm in lms
+                    ])
+                    left_eye = pts[MP_LEFT_EYE]
+                    right_eye = pts[MP_RIGHT_EYE]
+                    ear = (eye_aspect_ratio(left_eye) + eye_aspect_ratio(right_eye)) / 2.0
+                    for p in np.vstack([left_eye, right_eye]):
+                        cv2.circle(frame, tuple(p), 2, (0, 255, 100), -1)
             timings["5. Landmark + EAR"] = (time.perf_counter() - t) * 1000
 
             # ⑥ Decision & alert
             t = time.perf_counter()
             drowsy = False
+            calibration_elapsed = (
+                time.perf_counter() - calibration_start if is_calibrating else 0.0
+            )
             if is_calibrating:
                 if ear > 0:
                     calibration_ears.append(ear)
-                elapsed = time.perf_counter() - calibration_start
-                if elapsed >= calibration_seconds:
+                if calibration_elapsed >= calibration_seconds:
                     if calibration_ears:
                         current_threshold = float(np.median(calibration_ears) * calibration_ratio)
                         print(
@@ -764,13 +844,24 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
 
             draw_overlay(
                 frame, ear, drowsy, frame_counter, timings,
-                current_threshold, consecutive_frames, is_calibrating
+                current_threshold, consecutive_frames, is_calibrating,
+                calibration_elapsed, calibration_seconds
             )
             if display:
                 cv2.imshow("Drowsy Driver Detection", frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
                     quit_requested = True
                     break
+                if is_calibrating and key in (ord("c"), 27):
+                    is_calibrating = False
+                    calibration_ears.clear()
+                    current_threshold = ear_threshold
+                    frame_counter = 0
+                    print(
+                        "[INFO] Calibration cancelled; "
+                        f"using default threshold {current_threshold:.3f}"
+                    )
 
     finally:
         face_mesh.close()
@@ -884,14 +975,23 @@ def main():
                     help=f"EAR value below which eyes count as closed (default: {EAR_THRESHOLD})")
     ap.add_argument("--frames", type=int, default=CONSEC_FRAMES,
                     help=f"Consecutive closed-eye frames before alert (default: {CONSEC_FRAMES})")
+    ap.add_argument("--face-gate-grace", type=int, default=FACE_GATE_GRACE_FRAMES,
+                    help="Frames to keep running FaceMesh after Haar loses the face "
+                         f"(default: {FACE_GATE_GRACE_FRAMES})")
+    ap.add_argument("--facemesh-roi-margin", type=float, default=FACEMESH_ROI_MARGIN_RATIO,
+                    help="Haar face-box margin ratio for the FaceMesh processing crop "
+                         f"(default: {FACEMESH_ROI_MARGIN_RATIO})")
     ap.add_argument("--no-audio", action="store_true",
                     help="Disable the pygame alarm")
     ap.add_argument("--no-display", action="store_true",
                     help="Run without opening an OpenCV preview window")
-    ap.add_argument("--calibrate", action="store_true",
-                    help="Measure open-eye EAR first and derive a personal threshold")
+    calibration_group = ap.add_mutually_exclusive_group()
+    calibration_group.add_argument("--calibrate", dest="calibrate", action="store_true", default=True,
+                                   help="Measure open-eye EAR first and derive a personal threshold (default)")
+    calibration_group.add_argument("--no-calibrate", dest="calibrate", action="store_false",
+                                   help="Skip startup calibration and use the default EAR threshold")
     ap.add_argument("--calibration-seconds", type=float, default=5.0,
-                    help="Seconds to collect open-eye EAR when --calibrate is used (default: 5)")
+                    help="Seconds to collect open-eye EAR during calibration (default: 5)")
     ap.add_argument("--calibration-ratio", type=float, default=0.75,
                     help="Threshold = median open-eye EAR times this ratio (default: 0.75)")
     ap.add_argument("--native-logs", action="store_true",
@@ -907,6 +1007,10 @@ def main():
         sys.exit("[ERROR] --calibration-ratio must be greater than 0")
     if args.camera_scan_limit < 1:
         sys.exit("[ERROR] --camera-scan-limit must be at least 1")
+    if args.face_gate_grace < 0:
+        sys.exit("[ERROR] --face-gate-grace must be at least 0")
+    if args.facemesh_roi_margin < 0:
+        sys.exit("[ERROR] --facemesh-roi-margin must be at least 0")
 
     import cv2
 
@@ -952,6 +1056,8 @@ def main():
             calibrate=args.calibrate,
             calibration_seconds=args.calibration_seconds,
             calibration_ratio=args.calibration_ratio,
+            face_gate_grace_frames=args.face_gate_grace,
+            facemesh_roi_margin=args.facemesh_roi_margin,
             source_label=describe_video_source(source),
             quiet_native_logs=not args.native_logs,
         )

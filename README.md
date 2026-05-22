@@ -8,8 +8,9 @@ eyes stay closed for too many consecutive frames.
 ## Setup
 
 Use Python 3.12 for this project. The MediaPipe FaceMesh code uses the legacy
-`mediapipe.solutions` API, so Python 3.13 environments can install a package
-layout that does not work with this script.
+FaceMesh solution implementation through `mediapipe.python.solutions`, so
+Python 3.13 environments can install a package layout that does not work with
+this script.
 
 ```bash
 cd /Users/ben/Documents/GitHub/DrowsyDriverDetector
@@ -52,6 +53,9 @@ save a local label for the camera index you actually used, using camera names
 detected at startup or a custom label. Command-line inputs are still supported
 for testing and recorded videos.
 
+In the scan menu, choose a numbered camera, `R` to rename/save local camera
+labels, or `C` to enter a custom path, URL, or camera index.
+
 Webcam without picker:
 
 ```bash
@@ -71,13 +75,23 @@ python record_test.py
 python drowsy_detection.py --input test_video.mp4
 ```
 
+`record_test.py` records camera `0` to `test_video.mp4` for 20 seconds. It
+overwrites the previous test video and can be stopped early with `q`.
+
 IP camera:
 
 ```bash
 python drowsy_detection.py --input http://camera-url/video
 ```
 
+Calibration starts automatically when the OpenCV window opens. Keep your eyes
+open and face the camera while the `Calibrating` overlay is visible. Press `c`
+or `Esc` during calibration to cancel it and use the default EAR threshold.
 Press `q` in the OpenCV window to quit.
+
+In `--no-display` mode, there is no OpenCV window, overlay, or keyboard cancel
+handler. Use `--no-calibrate` for headless runs unless the first calibration
+seconds of the input show open eyes.
 
 When the run exits, the app prints the current run's per-stage performance
 report, appends the run to `pipeline_performance_log.csv`, prints a table of
@@ -102,7 +116,7 @@ python drowsy_detection.py --input 0 --no-audio
 Run without an OpenCV preview window:
 
 ```bash
-python drowsy_detection.py --input test_video.mp4 --no-display --no-audio
+python drowsy_detection.py --input test_video.mp4 --no-display --no-audio --no-calibrate
 ```
 
 Scan more camera indexes when using startup option 2:
@@ -117,14 +131,27 @@ Show low-level MediaPipe/TFLite diagnostics while debugging:
 python drowsy_detection.py --input 0 --native-logs
 ```
 
-Calibrate a personal threshold from your open eyes:
+Adjust the Haar face-detection gate. FaceMesh processes a padded crop around
+the Haar face box, and keeps running for this many missed Haar frames before
+being skipped:
 
 ```bash
-python drowsy_detection.py --input 0 --calibrate
+python drowsy_detection.py --input 0 --face-gate-grace 5
 ```
 
-During calibration, keep your eyes open and face the camera. The app measures
-your median open-eye EAR, then sets:
+Adjust the crop margin around the Haar face box before FaceMesh processing:
+
+```bash
+python drowsy_detection.py --input 0 --facemesh-roi-margin 0.20
+```
+
+Calibration is enabled by default. To skip it and use the default threshold:
+
+```bash
+python drowsy_detection.py --input 0 --no-calibrate
+```
+
+During calibration, the app measures your median open-eye EAR, then sets:
 
 ```text
 threshold = median_open_eye_ear * calibration_ratio
@@ -133,8 +160,24 @@ threshold = median_open_eye_ear * calibration_ratio
 The default calibration ratio is `0.75`. You can change it:
 
 ```bash
-python drowsy_detection.py --input 0 --calibrate --calibration-seconds 6 --calibration-ratio 0.72
+python drowsy_detection.py --input 0 --calibration-seconds 6 --calibration-ratio 0.72
 ```
+
+Calibration uses valid EAR samples collected during the first
+`--calibration-seconds` seconds of the selected source. If no face landmarks are
+detected during that window, the app keeps the configured `--ear-threshold`.
+
+## Generated Local Files
+
+The app creates a few local files while running:
+
+- `.cache/` stores Matplotlib and runtime cache files.
+- `.camera_aliases.json` stores camera labels you save from the scan menu.
+- `pipeline_performance_log.csv` stores per-run benchmark summaries.
+- `pipeline_performance_benchmark.png` stores the latest benchmark chart.
+- `test_video.mp4` is created by `record_test.py`.
+
+These files are ignored by git.
 
 ## Common Errors
 
@@ -154,11 +197,11 @@ source .venv/bin/activate
 python drowsy_detection.py
 ```
 
-`module 'mediapipe' has no attribute 'solutions'`
+MediaPipe FaceMesh import errors
 
 Recreate `.venv` with Python 3.12 and reinstall `requirements.txt`. The project
-pins MediaPipe to a tested 0.10.x version because the code uses the legacy
-FaceMesh API.
+pins MediaPipe to `0.10.20` because the code uses the legacy FaceMesh solution
+implementation.
 
 `CoreAudio error`
 
@@ -189,6 +232,10 @@ MediaPipe FaceMesh starts successfully. If you see an OpenGL or
 window instead of a restricted IDE runner. Also make sure you did not pass
 `--no-display`.
 
+If you intentionally pass `--no-display`, keyboard controls such as `q`, `c`,
+and `Esc` are unavailable from the OpenCV window. Video files stop when the file
+ends; webcam streams keep running until interrupted from the terminal.
+
 `[ERROR] Cannot open: '0'`
 
 OpenCV could not access your webcam. Check camera permissions, close other apps
@@ -200,9 +247,12 @@ For each frame:
 
 1. Convert BGR frame to grayscale.
 2. Apply Gaussian blur to reduce noise.
-3. Detect the face with Haar cascades.
-4. Draw an approximate eye-region crop for visualization.
-5. Use MediaPipe FaceMesh to get eye landmarks.
-6. Compute EAR from six landmarks per eye.
-7. Count consecutive frames where EAR is below the threshold.
-8. Mark drowsy and trigger the alarm when the counter reaches `--frames`.
+3. Detect the face with Haar cascades as a fast face-presence gate.
+4. Draw the detected face, padded FaceMesh crop, and approximate eye-region band on the full frame.
+5. Crop the padded face ROI from the raw frame and convert that crop to RGB.
+6. Use MediaPipe FaceMesh on the crop and remap landmarks to full-frame coordinates.
+7. Compute EAR from six landmarks per eye.
+8. During calibration, collect open-eye EAR samples and set
+   `threshold = median_open_eye_ear * calibration_ratio`.
+9. Count consecutive frames where EAR is below the threshold.
+10. Mark drowsy and trigger the alarm when the counter reaches `--frames`.
