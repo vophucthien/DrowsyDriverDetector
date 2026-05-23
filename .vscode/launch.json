@@ -2,11 +2,23 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Drowsy Detector",
-      "type": "debugpy",
+      "name": "Drowsy Detector GUI",
+      "type": "python",
       "request": "launch",
-      "program": "${workspaceFolder}/drowsy_detection.py",
-      "console": "integratedTerminal"
+      "program": "${workspaceFolder}/app.py",
+      "console": "integratedTerminal",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "justMyCode": true
+    },
+    {
+      "name": "Drowsy Detector Terminal Menu",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/app.py",
+      "args": ["--menu"],
+      "console": "integratedTerminal",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "justMyCode": true
     }
   ]
 }

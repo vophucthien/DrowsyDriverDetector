@@ -34,57 +34,89 @@ The Python path should point inside `.venv`, and MediaPipe should be
 
 ## Run
 
-In VS Code, open `drowsy_detection.py` and click **Run Python File**.
-
-The terminal shows two startup options: use the default built-in camera (`0`),
-or scan for available cameras and choose from the detected list. This is the
-main workflow.
-
-Terminal equivalent:
+Preferred workflow: open `app.py` in VS Code and click **Run Python File**, or
+run the same entry point from a terminal:
 
 ```bash
-source .venv/bin/activate
-python drowsy_detection.py
+python app.py
 ```
 
-The scanner checks camera indexes `0` through `4` by default and shows each
-OpenCV index with its detected resolution. After you quit with `q`, the app can
-save a local label for the camera index you actually used, using camera names
-detected at startup or a custom label. Command-line inputs are still supported
-for testing and recorded videos.
+This opens the live detector window immediately and starts calibration. The
+top-right buttons control the app:
 
-In the scan menu, choose a numbered camera, `R` to rename/save local camera
-labels, or `C` to enter a custom path, URL, or camera index.
+```text
+Settings     Recalibrate, reset EAR threshold, cycle GUI scale, camera, resolution
+Validation   Pause live detection, record validation clip, run validation test, show latest report
+```
 
-Webcam without picker:
+The Validation panel pauses live detection before running test actions. A
+validation run exports per-frame logs, computes metrics, runs failure analysis,
+and writes a readable Markdown report into a timestamped folder under
+`outputs/runs/`.
+
+The old terminal menu is still available:
 
 ```bash
-python drowsy_detection.py --input 0
+python app.py --menu
+```
+
+Direct validation without opening the menu:
+
+```bash
+python app.py --validate-all
+```
+
+## Structure
+
+```text
+app.py                         Main entry point
+drowsy_driver/detector.py      Live detector and controlled-clip evaluator
+drowsy_driver/validation.py    Recording, validation reports, and failure analysis
+```
+
+The implementation lives in the `drowsy_driver/` package. The lower-level
+modules are still useful for debugging:
+
+```bash
+python -m drowsy_driver.detector --input 0
+python -m drowsy_driver.validation --record
+```
+
+Direct webcam run without the GUI wrapper:
+
+```bash
+python -m drowsy_driver.detector --input 0
 ```
 
 Video file:
 
 ```bash
-python drowsy_detection.py --input test_video.mp4
+python -m drowsy_driver.detector --input outputs/test_video.mp4
 ```
 
-Record a short webcam test video:
+Record a webcam validation video:
 
 ```bash
-python record_test.py
-python drowsy_detection.py --input test_video.mp4
+python -m drowsy_driver.validation --record
+python -m drowsy_driver.detector --input outputs/test_video.mp4
 ```
 
-`record_test.py` opens a preview first and waits until you press `s` or Space.
-It then records camera `0` to a clean `test_video.mp4` for 20 seconds at a
-fixed 30 FPS timeline. The preview shows a large open-eye / closed-eye phase
-overlay with audio cues, but that overlay is not burned into the saved MP4. It
-overwrites the previous test video and can be stopped early with `q`.
+The recorder opens a preview first and waits until you press `s` or Space. It
+then records camera `0` to a clean `outputs/test_video.mp4` using one validation
+schedule that includes normal open-eye periods plus closed-eye durations near
+the detector boundary: 0.5s, 1.0s, 2.0s, and 3.0s. The preview shows large
+open-eye / closed-eye prompts with audio cues, but that overlay is not burned
+into the saved MP4. It overwrites the previous test video and can be stopped
+early with `q`.
+
+The recorder writes `outputs/test_video.schedule.json` next to the MP4.
+Controlled evaluation uses that sidecar automatically, so the one recording is
+enough for the validation report.
 
 IP camera:
 
 ```bash
-python drowsy_detection.py --input http://camera-url/video
+python -m drowsy_driver.detector --input http://camera-url/video
 ```
 
 Calibration starts automatically when the OpenCV window opens. Keep your eyes
@@ -97,58 +129,78 @@ handler. Use `--no-calibrate` for headless runs unless the first calibration
 seconds of the input show open eyes.
 
 When the run exits, the app prints the current run's per-stage performance
-report, appends the run to `pipeline_performance_log.csv`, prints a table of
+report, appends the run to `outputs/pipeline_performance_log.csv`, prints a table of
 all recorded runs plus the average row, and exports
-`pipeline_performance_benchmark.png` with the latest bottleneck chart. The log
-table is local; delete that CSV when you want to reset the recorded history.
-Alarm start/stop transitions are appended to `alarm_events_log.csv` when they
-occur.
+`outputs/pipeline_performance_benchmark.png` with the latest bottleneck chart.
+The log table is local; delete that CSV when you want to reset the recorded
+history. Alarm start/stop transitions are appended to
+`outputs/alarm_events_log.csv` when they occur.
 
 ## Useful Options
 
 Tune the EAR threshold and closed-frame count:
 
 ```bash
-python drowsy_detection.py --input 0 --ear-threshold 0.22 --frames 15
+python -m drowsy_driver.detector --input 0 --ear-threshold 0.22 --frames 15
 ```
 
 Disable audio:
 
 ```bash
-python drowsy_detection.py --input 0 --no-audio
+python -m drowsy_driver.detector --input 0 --no-audio
 ```
 
 Run without an OpenCV preview window:
 
 ```bash
-python drowsy_detection.py --input test_video.mp4 --no-display --no-audio --no-calibrate
+python -m drowsy_driver.detector --input outputs/test_video.mp4 --no-display --no-audio --no-calibrate
 ```
 
 Export a per-frame detector-state CSV:
 
 ```bash
-python drowsy_detection.py --input test_video.mp4 --frame-log frame_state_log.csv
+python -m drowsy_driver.detector --input outputs/test_video.mp4 --frame-log outputs/frame_state_log.csv
 ```
 
-Score the 5-second-open / 3-second-closed recording made by `record_test.py`:
+Score the validation recording directly:
 
 ```bash
-python drowsy_detection.py --input test_video.mp4 --no-display --no-audio --no-calibrate --eval-controlled
+python -m drowsy_driver.detector --input outputs/test_video.mp4 --no-display --no-audio --no-calibrate --eval-controlled
 ```
 
-This writes `frame_state_log.csv` and `controlled_evaluation_summary.json`,
-then prints TP/FP/TN/FN, precision, recall, F1, and alarm latency.
+This writes `outputs/frame_state_log.csv` and
+`outputs/controlled_evaluation_summary.json`,
+then prints plain-language accuracy percentages, frame counts, transition
+buffer exclusions, tracking-failure exclusions, and alarm latency. The default
+evaluation excludes 12 frames around each schedule transition to avoid
+penalizing human reaction time. Use `--eval-transition-buffer-frames 0` to
+reproduce the unbuffered historical metric.
+
+Run the same validation through the unified app:
+
+```bash
+python app.py --validate-all
+```
+
+Break down false positives and false negatives after an eval run:
+
+```bash
+python -m drowsy_driver.validation --analyze-failures \
+  --frame-log outputs/frame_state_log.csv \
+  --summary outputs/controlled_evaluation_summary.json \
+  --output outputs/fp_breakdown.json
+```
 
 Scan more camera indexes when using startup option 2:
 
 ```bash
-python drowsy_detection.py --camera-scan-limit 8
+python -m drowsy_driver.detector --camera-scan-limit 8
 ```
 
 Show low-level MediaPipe/TFLite diagnostics while debugging:
 
 ```bash
-python drowsy_detection.py --input 0 --native-logs
+python -m drowsy_driver.detector --input 0 --native-logs
 ```
 
 Adjust the Haar face-detection gate. FaceMesh processes a padded crop around
@@ -156,19 +208,19 @@ the Haar face box, and keeps running for this many missed Haar frames before
 being skipped:
 
 ```bash
-python drowsy_detection.py --input 0 --face-gate-grace 5
+python -m drowsy_driver.detector --input 0 --face-gate-grace 5
 ```
 
 Adjust the crop margin around the Haar face box before FaceMesh processing:
 
 ```bash
-python drowsy_detection.py --input 0 --facemesh-roi-margin 0.20
+python -m drowsy_driver.detector --input 0 --facemesh-roi-margin 0.20
 ```
 
 Calibration is enabled by default. To skip it and use the default threshold:
 
 ```bash
-python drowsy_detection.py --input 0 --no-calibrate
+python -m drowsy_driver.detector --input 0 --no-calibrate
 ```
 
 During calibration, the app measures your median open-eye EAR, then sets:
@@ -180,7 +232,7 @@ threshold = median_open_eye_ear * calibration_ratio
 The default calibration ratio is `0.75`. You can change it:
 
 ```bash
-python drowsy_detection.py --input 0 --calibration-seconds 6 --calibration-ratio 0.72
+python -m drowsy_driver.detector --input 0 --calibration-seconds 6 --calibration-ratio 0.72
 ```
 
 Calibration uses valid EAR samples collected during the first
@@ -191,15 +243,24 @@ detected during that window, the app keeps the configured `--ear-threshold`.
 
 The app creates a few local files while running:
 
-- `.cache/` stores Matplotlib and runtime cache files.
-- `.camera_aliases.json` stores camera labels you save from the scan menu.
-- `pipeline_performance_log.csv` stores per-run benchmark summaries.
-- `pipeline_performance_benchmark.png` stores the latest benchmark chart.
-- `alarm_events_log.csv` stores alarm start/stop transitions.
-- `frame_state_log.csv` stores per-frame detector state when requested or when
+- `outputs/` stores local generated files and is ignored by git.
+- `outputs/runs/` stores timestamped validation runs, each with config, logs, JSON
+  summaries, failure breakdowns, and `report.md`.
+- `outputs/cache/` stores Matplotlib and runtime cache files.
+- `outputs/camera_aliases.json` stores camera labels you save from the scan menu.
+- `outputs/pipeline_performance_log.csv` stores per-run benchmark summaries.
+- `outputs/pipeline_performance_benchmark.png` stores the latest benchmark chart.
+- `outputs/alarm_events_log.csv` stores alarm start/stop transitions.
+- `outputs/frame_state_log.csv` stores per-frame detector state when requested or when
   `--eval-controlled` is used.
-- `controlled_evaluation_summary.json` stores the latest controlled-clip score.
-- `test_video.mp4` is created by `record_test.py`.
+- `outputs/controlled_evaluation_summary.json` stores the latest controlled-clip score.
+- `outputs/controlled_evaluation_summary_<tag>.json` is used for tagged evaluation
+  runs.
+- `outputs/fp_breakdown.json` stores the optional false-positive/false-negative bucket
+  analysis.
+- `*.schedule.json` files store custom recording schedules created by
+  `python -m drowsy_driver.validation --record`.
+- `outputs/test_video.mp4` is created by `python -m drowsy_driver.validation --record`.
 
 These files are ignored by git.
 
@@ -218,7 +279,7 @@ Then click **Run Python File** again. Terminal equivalent:
 
 ```bash
 source .venv/bin/activate
-python drowsy_detection.py
+python -m drowsy_driver.detector
 ```
 
 MediaPipe FaceMesh import errors
@@ -235,9 +296,9 @@ device. You can also pass `--no-audio`.
 Slow launch or repeated `Matplotlib is building the font cache`
 
 MediaPipe imports Matplotlib internally. The app writes Matplotlib cache files
-to `.cache/` inside this project so the cache can be reused instead of rebuilt
-every launch. If startup is still very slow, make sure you are running the
-latest script from this repo and that `.cache/` is writable.
+to `outputs/cache/` so the cache can be reused instead of rebuilt every launch.
+If startup is still very slow, make sure you are running the latest script from
+this repo and that `outputs/cache/` is writable.
 
 Low-level MediaPipe/TFLite startup logs are hidden by default so normal runs
 show only the app's own status and benchmark output. Use `--native-logs` if you

@@ -5,8 +5,11 @@ import sys
 import json
 import csv
 import importlib.util
+import math
 import types
+import uuid
 from contextlib import contextmanager
+from pathlib import Path
 
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
@@ -14,19 +17,25 @@ os.environ.setdefault("GLOG_minloglevel", "2")
 os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "2")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+OUTPUT_DIR = PROJECT_ROOT / "outputs"
+CACHE_DIR = OUTPUT_DIR / "cache"
 EAR_THRESHOLD = 0.22   # below this → eye considered closed/drowsy
 CONSEC_FRAMES = 15     # consecutive drowsy frames before alarm (~0.5s @ 30fps)
 FACE_GATE_GRACE_FRAMES = 5  # keep FaceMesh running briefly after Haar loses face
 FACEMESH_ROI_MARGIN_RATIO = 0.20  # expand Haar face box before FaceMesh crop
-APP_CACHE_DIR = os.path.join(os.path.dirname(__file__), ".cache")
-CAMERA_ALIASES_FILE = os.path.join(os.path.dirname(__file__), ".camera_aliases.json")
-PERFORMANCE_LOG_FILE = os.path.join(os.path.dirname(__file__), "pipeline_performance_log.csv")
-FRAME_LOG_FILE = os.path.join(os.path.dirname(__file__), "frame_state_log.csv")
-ALARM_EVENT_LOG_FILE = os.path.join(os.path.dirname(__file__), "alarm_events_log.csv")
-CONTROLLED_EVAL_FILE = os.path.join(os.path.dirname(__file__), "controlled_evaluation_summary.json")
+APP_CACHE_DIR = str(CACHE_DIR)
+CAMERA_ALIASES_FILE = str(OUTPUT_DIR / "camera_aliases.json")
+PERFORMANCE_LOG_FILE = str(OUTPUT_DIR / "pipeline_performance_log.csv")
+FRAME_LOG_FILE = str(OUTPUT_DIR / "frame_state_log.csv")
+ALARM_EVENT_LOG_FILE = str(OUTPUT_DIR / "alarm_events_log.csv")
+CONTROLLED_EVAL_FILE = str(OUTPUT_DIR / "controlled_evaluation_summary.json")
 CONTROLLED_OPEN_SECONDS = 5.0
 CONTROLLED_CLOSED_SECONDS = 3.0
-CONTROLLED_EXPECTED_SECONDS = 20.0
+CONTROLLED_EXPECTED_SECONDS = 31.5
+EVAL_TRANSITION_BUFFER_FRAMES = 12
+EVAL_BOOTSTRAP_ITERATIONS = 1000
+EVAL_BOOTSTRAP_SEED = 42
 
 # MediaPipe FaceMesh 6-point EAR indices (Soukupova and Cech, 2016)
 MP_LEFT_EYE  = [33,  160, 158, 133, 153, 144]
@@ -36,11 +45,9 @@ MP_RIGHT_EYE = [362, 385, 387, 263, 373, 380]
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def eye_aspect_ratio(eye_pts) -> float:
-    from scipy.spatial import distance as dist
-
-    A = dist.euclidean(eye_pts[1], eye_pts[5])
-    B = dist.euclidean(eye_pts[2], eye_pts[4])
-    C = dist.euclidean(eye_pts[0], eye_pts[3])
+    A = math.dist(eye_pts[1], eye_pts[5])
+    B = math.dist(eye_pts[2], eye_pts[4])
+    C = math.dist(eye_pts[0], eye_pts[3])
     return (A + B) / (2.0 * C)
 
 
@@ -84,6 +91,28 @@ def ensure_parent_dir(path):
         os.makedirs(parent, exist_ok=True)
 
 
+def make_run_id():
+    return f"run_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"
+
+
+def tagged_output_path(path, tag):
+    if not path or not tag or tag == "dev":
+        return path
+    root, ext = os.path.splitext(path)
+    return f"{root}_{tag}{ext}" if ext else f"{path}_{tag}"
+
+
+def sidecar_schedule_path(video_path):
+    root, _ext = os.path.splitext(video_path)
+    return f"{root}.schedule.json"
+
+
+def sidecar_schedule_candidates(video_path):
+    primary = sidecar_schedule_path(video_path)
+    legacy = f"{video_path}.schedule.json"
+    return [primary] if primary == legacy else [primary, legacy]
+
+
 def configure_runtime_cache():
     os.makedirs(APP_CACHE_DIR, exist_ok=True)
     matplotlib_dir = os.path.join(APP_CACHE_DIR, "matplotlib")
@@ -102,11 +131,18 @@ def load_face_mesh_class():
         raise RuntimeError("MediaPipe is not installed in this Python environment.")
 
     root = next(iter(spec.submodule_search_locations))
-    if "mediapipe" not in sys.modules:
-        mediapipe_pkg = types.ModuleType("mediapipe")
-        mediapipe_pkg.__path__ = [root]
-        mediapipe_pkg.__package__ = "mediapipe"
-        sys.modules["mediapipe"] = mediapipe_pkg
+
+    def ensure_package(name, path):
+        if name in sys.modules:
+            return
+        package = types.ModuleType(name)
+        package.__path__ = [path]
+        package.__package__ = name
+        sys.modules[name] = package
+
+    ensure_package("mediapipe", root)
+    ensure_package("mediapipe.python", os.path.join(root, "python"))
+    ensure_package("mediapipe.python.solutions", os.path.join(root, "python", "solutions"))
 
     try:
         from mediapipe.python.solutions.face_mesh import FaceMesh
@@ -201,6 +237,26 @@ def append_csv_rows(path, fieldnames, rows):
     try:
         ensure_parent_dir(path)
         needs_header = not os.path.exists(path) or os.path.getsize(path) == 0
+        if not needs_header:
+            try:
+                with open(path, "r", encoding="utf-8", newline="") as f:
+                    existing_header = next(csv.reader(f), [])
+                missing_fields = [field for field in fieldnames if field not in existing_header]
+                if missing_fields:
+                    root, ext = os.path.splitext(path)
+                    legacy_path = f"{root}_legacy{ext}"
+                    suffix = 1
+                    while os.path.exists(legacy_path):
+                        legacy_path = f"{root}_legacy_{suffix}{ext}"
+                        suffix += 1
+                    os.replace(path, legacy_path)
+                    print(
+                        f"[INFO] Existing append log schema moved to '{legacy_path}' "
+                        "before writing the new schema."
+                    )
+                    needs_header = True
+            except (OSError, StopIteration, csv.Error):
+                needs_header = True
         with open(path, "a", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
             if needs_header:
@@ -231,30 +287,311 @@ def ordered_fieldnames(rows):
     return fieldnames
 
 
-def controlled_ground_truth(time_seconds, open_seconds, closed_seconds):
+def normalize_explicit_schedule(schedule):
+    if not schedule:
+        return None
+    normalized = []
+    for item in schedule:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ValueError("Schedule entries must be [phase, duration] pairs.")
+        phase = str(item[0]).strip().lower()
+        if phase not in {"open", "closed"}:
+            raise ValueError(f"Unsupported schedule phase '{item[0]}'. Use open or closed.")
+        duration = float(item[1])
+        if duration <= 0:
+            raise ValueError("Schedule durations must be greater than 0.")
+        normalized.append((phase, duration))
+    return normalized
+
+
+def load_controlled_schedule_sidecar(input_value):
+    if not isinstance(input_value, str) or "://" in input_value:
+        return None
+    for path in sidecar_schedule_candidates(input_value):
+        if not os.path.exists(path):
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        schedule = normalize_explicit_schedule(data.get("schedule"))
+        if not schedule:
+            raise ValueError(f"Schedule sidecar '{path}' has no usable schedule.")
+        total_seconds = data.get("total_seconds")
+        if total_seconds is None:
+            total_seconds = sum(duration for _phase, duration in schedule)
+        fps = data.get("fps")
+        return {
+            "path": path,
+            "schedule": schedule,
+            "total_seconds": float(total_seconds),
+            "fps": safe_float(fps),
+        }
+    return None
+
+
+def build_eval_segments(open_seconds, closed_seconds, max_time_seconds, explicit_schedule=None):
+    segments = []
+    if explicit_schedule:
+        start = 0.0
+        for index, (phase, duration) in enumerate(explicit_schedule):
+            end = start + duration
+            segments.append({
+                "index": index,
+                "phase": phase,
+                "start": start,
+                "end": end,
+                "duration": duration,
+            })
+            start = end
+        return segments
+
     cycle_seconds = open_seconds + closed_seconds
     if cycle_seconds <= 0:
-        return "open"
-    cycle_position = time_seconds % cycle_seconds
-    return "closed" if cycle_position >= open_seconds else "open"
+        return []
+    cycles = int(max_time_seconds // cycle_seconds) + 2
+    for cycle_index in range(cycles):
+        cycle_start = cycle_index * cycle_seconds
+        segments.append({
+            "index": cycle_index * 2,
+            "phase": "open",
+            "start": cycle_start,
+            "end": cycle_start + open_seconds,
+            "duration": open_seconds,
+        })
+        segments.append({
+            "index": cycle_index * 2 + 1,
+            "phase": "closed",
+            "start": cycle_start + open_seconds,
+            "end": cycle_start + cycle_seconds,
+            "duration": closed_seconds,
+        })
+    return segments
 
 
-def calculate_controlled_evaluation(frame_rows, open_seconds, closed_seconds):
+def label_controlled_frame(time_seconds, segments, transition_buffer_frames=0, fps=30.0):
+    if not segments:
+        return {
+            "label": "open",
+            "near_boundary": False,
+            "segment_index": "",
+            "segment_start": None,
+            "segment_duration": None,
+        }
+
+    segment = segments[-1]
+    for candidate in segments:
+        if candidate["start"] <= time_seconds < candidate["end"]:
+            segment = candidate
+            break
+
+    near_boundary = False
+    if fps > 0 and transition_buffer_frames > 0:
+        frame_number = int(round(time_seconds * fps))
+        boundaries = [candidate["start"] for candidate in segments[1:]]
+        near_boundary = any(
+            abs(frame_number - int(round(boundary * fps))) <= transition_buffer_frames
+            for boundary in boundaries
+        )
+
+    return {
+        "label": segment["phase"],
+        "near_boundary": near_boundary,
+        "segment_index": str(segment["index"]),
+        "segment_start": segment["start"],
+        "segment_duration": segment["duration"],
+    }
+
+
+def row_truthy(row, field):
+    value = row.get(field, "")
+    return str(value).strip().lower() in {"1", "true", "yes"}
+
+
+def row_float(row, field, default=0.0):
+    try:
+        return float(row.get(field, ""))
+    except (TypeError, ValueError):
+        return default
+
+
+def row_int(row, field, default=0):
+    try:
+        return int(float(row.get(field, "")))
+    except (TypeError, ValueError):
+        return default
+
+
+def landmark_count_from_row(row):
+    count = row_int(row, "landmarks_found", default=0)
+    if count == 1 and row_truthy(row, "facemesh_ran"):
+        return 478
+    return count
+
+
+def tracking_failed(row):
+    facemesh_ran = row_truthy(row, "facemesh_ran")
+    landmark_count = landmark_count_from_row(row)
+    no_face_after_grace = (
+        not row_truthy(row, "face_detected")
+        and not row_truthy(row, "haar_box_reused")
+        and not row_truthy(row, "face_gate_active")
+    )
+    return (not facemesh_ran) or landmark_count < 12 or no_face_after_grace
+
+
+def metrics_from_counts(counts, nan_on_zero=False):
+    import math
+
+    precision_denominator = counts["tp"] + counts["fp"]
+    recall_denominator = counts["tp"] + counts["fn"]
+    if precision_denominator:
+        precision = counts["tp"] / precision_denominator
+    else:
+        precision = math.nan if nan_on_zero else 0.0
+    if recall_denominator:
+        recall = counts["tp"] / recall_denominator
+    else:
+        recall = math.nan if nan_on_zero else 0.0
+    if precision != precision or recall != recall or precision + recall == 0:
+        f1 = math.nan if nan_on_zero else 0.0
+    else:
+        f1 = 2.0 * precision * recall / (precision + recall)
+    return {"precision": precision, "recall": recall, "f1": f1}
+
+
+def counts_from_pairs(pairs):
     counts = {"tp": 0, "fp": 0, "tn": 0, "fn": 0}
-    closed_segment_starts = {}
-    detected_segment_times = {}
+    for actual_closed, predicted_closed in pairs:
+        if actual_closed and predicted_closed:
+            counts["tp"] += 1
+        elif actual_closed:
+            counts["fn"] += 1
+        elif predicted_closed:
+            counts["fp"] += 1
+        else:
+            counts["tn"] += 1
+    return counts
+
+
+def percentile_ci(values):
+    import numpy as np
+
+    if not values:
+        return [None, None]
+    arr = np.array(values, dtype=float)
+    if np.all(np.isnan(arr)):
+        return [None, None]
+    low, high = np.nanpercentile(arr, [2.5, 97.5])
+    return [float(low), float(high)]
+
+
+def bootstrap_metric_cis(eligible_pairs, iterations, seed):
+    import numpy as np
+
+    if iterations <= 0 or not eligible_pairs:
+        return {
+            "precision_ci_95": [None, None],
+            "recall_ci_95": [None, None],
+            "f1_ci_95": [None, None],
+        }
+
+    rng = np.random.default_rng(seed)
+    pair_count = len(eligible_pairs)
+    precisions = []
+    recalls = []
+    f1s = []
+    for _ in range(iterations):
+        sample_indexes = rng.choice(pair_count, size=pair_count, replace=True)
+        sample = [eligible_pairs[int(i)] for i in sample_indexes]
+        metrics = metrics_from_counts(counts_from_pairs(sample), nan_on_zero=True)
+        precisions.append(metrics["precision"])
+        recalls.append(metrics["recall"])
+        f1s.append(metrics["f1"])
+
+    return {
+        "precision_ci_95": percentile_ci(precisions),
+        "recall_ci_95": percentile_ci(recalls),
+        "f1_ci_95": percentile_ci(f1s),
+    }
+
+
+def schedule_summary(open_seconds, closed_seconds, explicit_schedule=None, source_fps=0.0,
+                     sidecar_path=None):
+    if explicit_schedule:
+        total_seconds = sum(duration for _phase, duration in explicit_schedule)
+        return {
+            "type": "explicit",
+            "sidecar": sidecar_path,
+            "schedule": [[phase, duration] for phase, duration in explicit_schedule],
+            "total_seconds": total_seconds,
+            "fps": source_fps,
+        }
     cycle_seconds = open_seconds + closed_seconds
+    return {
+        "type": "cyclic",
+        "open_seconds": open_seconds,
+        "closed_seconds": closed_seconds,
+        "cycle_seconds": cycle_seconds,
+        "fps": source_fps,
+    }
+
+
+def calculate_controlled_evaluation(
+        frame_rows, open_seconds, closed_seconds, transition_buffer_frames=0,
+        bootstrap_iterations=EVAL_BOOTSTRAP_ITERATIONS,
+        bootstrap_seed=EVAL_BOOTSTRAP_SEED, source_fps=30.0,
+        explicit_schedule=None, schedule_sidecar_path=None, eval_tag="dev",
+        run_id=None):
+    parsed_times = [row_float(row, "time_seconds", default=-1.0) for row in frame_rows]
+    parsed_times = [value for value in parsed_times if value >= 0]
+    max_time_seconds = max(parsed_times) if parsed_times else 0.0
+    segments = build_eval_segments(open_seconds, closed_seconds, max_time_seconds, explicit_schedule)
+
+    counts = {"tp": 0, "fp": 0, "tn": 0, "fn": 0}
+    eligible_pairs = []
+    total_frames = 0
+    buffer_frames_excluded = 0
+    buffer_by_label = {"open": 0, "closed": 0}
+    tracking_failed_frames = 0
+    tracking_failed_by_label = {"open": 0, "closed": 0}
+    closed_segments = {}
 
     for row in frame_rows:
-        try:
-            time_seconds = float(row.get("time_seconds", ""))
-        except (TypeError, ValueError):
+        time_seconds = row_float(row, "time_seconds", default=-1.0)
+        if time_seconds < 0:
+            continue
+        total_frames += 1
+
+        label = label_controlled_frame(
+            time_seconds, segments, transition_buffer_frames, source_fps
+        )
+        truth = label["label"]
+        actual_closed = truth == "closed"
+        predicted_closed = row_truthy(row, "drowsy")
+
+        if actual_closed:
+            key = label["segment_index"]
+            if key not in closed_segments:
+                closed_segments[key] = {
+                    "start": label["segment_start"],
+                    "duration": label["segment_duration"],
+                    "detected": False,
+                    "latency": None,
+                }
+            if predicted_closed and not closed_segments[key]["detected"]:
+                closed_segments[key]["detected"] = True
+                closed_segments[key]["latency"] = time_seconds - label["segment_start"]
+
+        if label["near_boundary"]:
+            buffer_frames_excluded += 1
+            buffer_by_label[truth] += 1
             continue
 
-        truth = controlled_ground_truth(time_seconds, open_seconds, closed_seconds)
-        predicted_closed = row.get("drowsy") == "1"
-        actual_closed = truth == "closed"
+        if tracking_failed(row):
+            tracking_failed_frames += 1
+            tracking_failed_by_label[truth] += 1
+            continue
 
+        eligible_pairs.append((actual_closed, predicted_closed))
         if actual_closed and predicted_closed:
             counts["tp"] += 1
         elif actual_closed:
@@ -264,48 +601,63 @@ def calculate_controlled_evaluation(frame_rows, open_seconds, closed_seconds):
         else:
             counts["tn"] += 1
 
-        if actual_closed and cycle_seconds > 0:
-            segment_index = int(time_seconds // cycle_seconds)
-            segment_start = segment_index * cycle_seconds + open_seconds
-            closed_segment_starts.setdefault(str(segment_index), segment_start)
-            if predicted_closed:
-                detected_segment_times.setdefault(str(segment_index), time_seconds)
+    metrics = metrics_from_counts(counts)
+    cis = bootstrap_metric_cis(eligible_pairs, bootstrap_iterations, bootstrap_seed)
+    latencies = [
+        segment["latency"] for segment in closed_segments.values()
+        if segment["latency"] is not None
+    ]
+    closed_segment_list = [
+        {
+            "start": segment["start"],
+            "duration": segment["duration"],
+            "detected": segment["detected"],
+            "latency": segment["latency"],
+        }
+        for _key, segment in sorted(
+            closed_segments.items(), key=lambda item: (item[1]["start"] is None, item[1]["start"])
+        )
+    ]
+    denominator = total_frames - buffer_frames_excluded
+    tracking_failure_rate = tracking_failed_frames / denominator if denominator > 0 else 0.0
 
-    precision_denominator = counts["tp"] + counts["fp"]
-    recall_denominator = counts["tp"] + counts["fn"]
-    precision = counts["tp"] / precision_denominator if precision_denominator else 0.0
-    recall = counts["tp"] / recall_denominator if recall_denominator else 0.0
-    f1_denominator = precision + recall
-    f1 = (2.0 * precision * recall / f1_denominator) if f1_denominator else 0.0
-
-    latencies = []
-    for segment_index, segment_start in closed_segment_starts.items():
-        detected_at = detected_segment_times.get(segment_index)
-        if detected_at is not None:
-            latencies.append(detected_at - segment_start)
-
-    return {
-        "schedule": {
-            "open_seconds": open_seconds,
-            "closed_seconds": closed_seconds,
-            "cycle_seconds": cycle_seconds,
-        },
+    summary = {
+        "run_id": run_id,
+        "eval_tag": eval_tag,
+        "schedule": schedule_summary(
+            open_seconds, closed_seconds, explicit_schedule, source_fps, schedule_sidecar_path
+        ),
+        "total_frames": total_frames,
         "frames_evaluated": sum(counts.values()),
+        "eligible_frames": len(eligible_pairs),
         "counts": counts,
-        "metrics": {
-            "precision": precision,
-            "recall": recall,
-            "f1": f1,
-        },
+        "metrics": metrics,
+        "precision_ci_95": cis["precision_ci_95"],
+        "recall_ci_95": cis["recall_ci_95"],
+        "f1_ci_95": cis["f1_ci_95"],
+        "bootstrap_iterations": bootstrap_iterations,
+        "bootstrap_seed": bootstrap_seed,
+        "buffer_frames_excluded": buffer_frames_excluded,
+        "buffer_frames_in_open_segments": buffer_by_label["open"],
+        "buffer_frames_in_closed_segments": buffer_by_label["closed"],
+        "eval_transition_buffer_frames": transition_buffer_frames,
+        "tracking_failed_frames": tracking_failed_frames,
+        "tracking_failed_in_open_segments": tracking_failed_by_label["open"],
+        "tracking_failed_in_closed_segments": tracking_failed_by_label["closed"],
+        "tracking_failure_rate": tracking_failure_rate,
+        "closed_segments": closed_segment_list,
         "detection_latency_seconds": {
             "detected_closed_segments": len(latencies),
-            "total_closed_segments": len(closed_segment_starts),
+            "total_closed_segments": len(closed_segments),
+            "closed_segments_detected": f"{len(latencies)}/{len(closed_segments)}",
             "mean": sum(latencies) / len(latencies) if latencies else None,
             "min": min(latencies) if latencies else None,
             "max": max(latencies) if latencies else None,
             "values": latencies,
+            "closed_segments": closed_segment_list,
         },
     }
+    return summary
 
 
 def print_controlled_evaluation(summary, output_path=None):
@@ -313,21 +665,53 @@ def print_controlled_evaluation(summary, output_path=None):
     metrics = summary["metrics"]
     latency = summary["detection_latency_seconds"]
 
+    def fmt_percent(value):
+        return f"{float(value) * 100:.1f}%"
+
     print("\n" + "=" * 55)
     print("         CONTROLLED CLIP EVALUATION REPORT          ")
     print("=" * 55)
+    schedule = summary["schedule"]
+    if schedule.get("type") == "explicit":
+        print(
+            f"Schedule: explicit sidecar with {len(schedule.get('schedule', []))} phases "
+            f"({schedule.get('total_seconds', 0.0):.2f}s)"
+        )
+    else:
+        print(
+            f"Schedule: open {schedule['open_seconds']:.2f}s, "
+            f"closed {schedule['closed_seconds']:.2f}s"
+        )
     print(
-        f"Schedule: open {summary['schedule']['open_seconds']:.2f}s, "
-        f"closed {summary['schedule']['closed_seconds']:.2f}s"
+        f"Frames evaluated: {summary['frames_evaluated']} "
+        f"eligible / {summary.get('total_frames', summary['frames_evaluated'])} total"
     )
-    print(f"Frames evaluated: {summary['frames_evaluated']}")
+    if summary.get("buffer_frames_excluded", 0):
+        print(
+            f"Transition buffer excluded: {summary['buffer_frames_excluded']} frames "
+            f"(open {summary['buffer_frames_in_open_segments']}, "
+            f"closed {summary['buffer_frames_in_closed_segments']})"
+        )
     print(
-        f"TP: {counts['tp']}  FP: {counts['fp']}  "
-        f"TN: {counts['tn']}  FN: {counts['fn']}"
+        f"Tracking failures excluded: {summary.get('tracking_failed_frames', 0)} "
+        f"({summary.get('tracking_failure_rate', 0.0):.3%})"
     )
     print(
-        f"Precision: {metrics['precision']:.3f}  "
-        f"Recall: {metrics['recall']:.3f}  F1: {metrics['f1']:.3f}"
+        f"Sleepy caught: {counts['tp']}  False alarms: {counts['fp']}  "
+        f"Awake correct: {counts['tn']}  Sleepy missed: {counts['fn']}"
+    )
+    precision_ci = summary.get("precision_ci_95", [None, None])
+    recall_ci = summary.get("recall_ci_95", [None, None])
+    f1_ci = summary.get("f1_ci_95", [None, None])
+    def fmt_ci(ci):
+        if not ci or ci[0] is None or ci[1] is None:
+            return "[95% CI n/a]"
+        return f"[95% CI {fmt_percent(ci[0])}-{fmt_percent(ci[1])}]"
+
+    print(
+        f"Correct alarms: {fmt_percent(metrics['precision'])} {fmt_ci(precision_ci)}  "
+        f"Sleepy frames caught: {fmt_percent(metrics['recall'])} {fmt_ci(recall_ci)}  "
+        f"Overall score: {fmt_percent(metrics['f1'])} {fmt_ci(f1_ci)}"
     )
     print(
         "Closed segments detected: "
@@ -359,27 +743,52 @@ def warn_if_controlled_input_is_short(cap, expected_seconds):
     if duration < expected_seconds * 0.95:
         print(
             f"[WARN] Controlled input is shorter than the expected "
-            f"{expected_seconds:.1f}s recording. Re-run record_test.py and wait "
-            "for it to finish; the full default clip should be 600 frames at 30 FPS."
+            f"{expected_seconds:.1f}s recording. Re-run the validation recorder and wait "
+            f"for it to finish; the full default clip should be about "
+            f"{int(round(expected_seconds * 30))} frames at 30 FPS."
         )
 
 
-def append_performance_log(mean_timings, frame_count, total_mean_latency, mean_fps, source_label):
+def validate_controlled_source_fps(fps):
+    fps = safe_float(fps)
+    if 15.0 <= fps <= 120.0:
+        return fps
+    raise RuntimeError(
+        f"Source FPS could not be determined (got {fps}). "
+        "For controlled-clip evaluation, source FPS must be reported correctly "
+        "by the container. Either re-encode the clip with a known fixed FPS, "
+        "or pass --eval-assume-fps <value> to override."
+    )
+
+
+def append_performance_log(mean_timings, frame_count, total_mean_latency, mean_fps,
+                           source_label, run_id=None, total_loop_mean_ms=None,
+                           overhead_mean_ms=None):
     existing_fields, rows = read_performance_log()
     stage_fields = [performance_stage_column(stage) for stage in mean_timings]
-    standard_fields = ["timestamp", "source", "frames", *stage_fields, "total_ms", "fps"]
+    standard_fields = [
+        "run_id", "timestamp", "source", "frames", *stage_fields,
+        "total_ms", "fps", "total_loop_mean_ms", "overhead_mean_ms",
+    ]
 
     fieldnames = []
-    for field in [*existing_fields, *standard_fields]:
+    for field in [*standard_fields, *existing_fields]:
         if field and field not in fieldnames:
             fieldnames.append(field)
 
     row = {
+        "run_id": run_id or "",
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "source": source_label,
         "frames": str(frame_count),
         "total_ms": f"{total_mean_latency:.6f}",
         "fps": f"{mean_fps:.6f}",
+        "total_loop_mean_ms": (
+            f"{total_loop_mean_ms:.6f}" if total_loop_mean_ms is not None else ""
+        ),
+        "overhead_mean_ms": (
+            f"{overhead_mean_ms:.6f}" if overhead_mean_ms is not None else ""
+        ),
     }
     for stage, ms in mean_timings.items():
         row[performance_stage_column(stage)] = f"{ms:.6f}"
@@ -664,7 +1073,7 @@ def find_camera_sources(cv2, scan_limit=5):
 
 def edit_camera_aliases(cameras):
     aliases = load_camera_aliases()
-    print("\nCamera aliases are saved locally in .camera_aliases.json.")
+    print(f"\nCamera aliases are saved locally in {CAMERA_ALIASES_FILE}.")
     print("Press Enter to keep the current label, or type '-' to clear it.")
 
     for source, label in cameras:
@@ -806,40 +1215,55 @@ def init_alarm(enabled=True):
 # ── Overlay ───────────────────────────────────────────────────────────────────
 
 def draw_overlay(frame, ear, drowsy, frame_counter, timings, threshold, frame_limit,
-                 calibrating=False, calibration_elapsed=0.0, calibration_seconds=0.0):
+                 calibrating=False, calibration_elapsed=0.0, calibration_seconds=0.0,
+                 ui_scale=None):
     import cv2
 
     h, w = frame.shape[:2]
+    if ui_scale is None:
+        ui_scale = max(0.65, min(w / 640.0, h / 480.0))
+
+    def scaled(value):
+        return int(round(value * ui_scale))
+
+    def thickness(value):
+        return max(1, int(round(value * ui_scale)))
 
     if drowsy:
         overlay = frame.copy()
         cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 180), -1)
         cv2.addWeighted(overlay, 0.18, frame, 0.82, 0, frame)
         alert = "! DROWSY  WAKE UP !"
-        (alert_w, _), _ = cv2.getTextSize(alert, cv2.FONT_HERSHEY_DUPLEX, 1.28, 3)
+        alert_scale = 1.28 * ui_scale
+        alert_thickness = thickness(3)
+        (alert_w, _), _ = cv2.getTextSize(alert, cv2.FONT_HERSHEY_DUPLEX, alert_scale, alert_thickness)
         cv2.putText(frame, alert,
                     (w // 2 - alert_w // 2, h // 2),
-                    cv2.FONT_HERSHEY_DUPLEX, 1.28, (0, 0, 255), 3)
+                    cv2.FONT_HERSHEY_DUPLEX, alert_scale, (0, 0, 255), alert_thickness)
 
     status_color = (0, 0, 255) if drowsy else (0, 220, 0)
     status = "Calibrating" if calibrating else ("DROWSY" if drowsy else "Awake")
     status_color = (0, 200, 255) if calibrating else status_color
     cv2.putText(frame, f"Status: {status}",
-                (10, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.98, status_color, 2)
+                (scaled(10), scaled(34)), cv2.FONT_HERSHEY_SIMPLEX,
+                0.98 * ui_scale, status_color, thickness(2))
     cv2.putText(frame,
                 f"EAR: {ear:.3f}   threshold: {threshold:.3f}   closed frames: {frame_counter}/{frame_limit}",
-                (10, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 1)
+                (scaled(10), scaled(68)), cv2.FONT_HERSHEY_SIMPLEX,
+                0.62 * ui_scale, (255, 255, 255), thickness(1))
 
-    y, total = 102, 0.0
+    y, total = scaled(102), 0.0
     for label, ms in timings.items():
         cv2.putText(frame, f"{label}: {ms:.1f} ms",
-                    (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (170, 170, 170), 1)
-        y += 22
+                    (scaled(10), y), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.50 * ui_scale, (170, 170, 170), thickness(1))
+        y += scaled(22)
         total += ms
 
     fps = 1000.0 / total if total > 0 else 0.0
     cv2.putText(frame, f"Pipeline: {total:.1f} ms  (~{fps:.1f} FPS)",
-                (10, y + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 200, 50), 1)
+                (scaled(10), y + scaled(8)), cv2.FONT_HERSHEY_SIMPLEX,
+                0.58 * ui_scale, (255, 200, 50), thickness(1))
 
     if calibrating:
         overlay = frame.copy()
@@ -851,24 +1275,26 @@ def draw_overlay(frame, ear, drowsy, frame_counter, timings, threshold, frame_li
         details = f"Keep eyes open ({remaining:.1f}s)"
         cancel = "C/Esc: cancel and use default EAR threshold"
 
-        title_scale = 1.58
-        title_thickness = 3
+        title_scale = 1.58 * ui_scale
+        title_thickness = thickness(3)
         (title_w, _), _ = cv2.getTextSize(
             title, cv2.FONT_HERSHEY_DUPLEX, title_scale, title_thickness
         )
-        detail_scale = 0.72
-        cancel_scale = 0.66
-        (detail_w, _), _ = cv2.getTextSize(details, cv2.FONT_HERSHEY_SIMPLEX, detail_scale, 2)
-        (cancel_w, _), _ = cv2.getTextSize(cancel, cv2.FONT_HERSHEY_SIMPLEX, cancel_scale, 1)
+        detail_scale = 0.72 * ui_scale
+        cancel_scale = 0.66 * ui_scale
+        detail_thickness = thickness(2)
+        cancel_thickness = thickness(1)
+        (detail_w, _), _ = cv2.getTextSize(details, cv2.FONT_HERSHEY_SIMPLEX, detail_scale, detail_thickness)
+        (cancel_w, _), _ = cv2.getTextSize(cancel, cv2.FONT_HERSHEY_SIMPLEX, cancel_scale, cancel_thickness)
 
         cx = w // 2
         cy = h // 2
-        cv2.putText(frame, title, (cx - title_w // 2, cy - 34),
+        cv2.putText(frame, title, (cx - title_w // 2, cy - scaled(34)),
                     cv2.FONT_HERSHEY_DUPLEX, title_scale, (0, 220, 255), title_thickness)
-        cv2.putText(frame, details, (cx - detail_w // 2, cy + 16),
-                    cv2.FONT_HERSHEY_SIMPLEX, detail_scale, (255, 255, 255), 2)
-        cv2.putText(frame, cancel, (cx - cancel_w // 2, cy + 54),
-                    cv2.FONT_HERSHEY_SIMPLEX, cancel_scale, (210, 210, 210), 1)
+        cv2.putText(frame, details, (cx - detail_w // 2, cy + scaled(16)),
+                    cv2.FONT_HERSHEY_SIMPLEX, detail_scale, (255, 255, 255), detail_thickness)
+        cv2.putText(frame, cancel, (cx - cancel_w // 2, cy + scaled(54)),
+                    cv2.FONT_HERSHEY_SIMPLEX, cancel_scale, (210, 210, 210), cancel_thickness)
 
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
@@ -883,7 +1309,10 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
         eval_controlled=False,
         eval_open_seconds=CONTROLLED_OPEN_SECONDS,
         eval_closed_seconds=CONTROLLED_CLOSED_SECONDS,
-        eval_output_path=None):
+        eval_output_path=None, eval_transition_buffer_frames=0,
+        eval_bootstrap_iterations=EVAL_BOOTSTRAP_ITERATIONS,
+        eval_bootstrap_seed=EVAL_BOOTSTRAP_SEED, eval_schedule=None,
+        eval_schedule_path=None, eval_tag="dev", run_id=None):
     import cv2
     import numpy as np
 
@@ -926,12 +1355,18 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
 
     # Initialize data store list for performance monitoring metrics
     all_timings_data = []
+    loop_timings = []
     quit_requested = False
     quiet_frames_remaining = 2 if quiet_native_logs else 0
     haar_face_seen = False
     haar_miss_frames = 0
     last_face_box = None
     source_fps = safe_float(source_fps)
+    if eval_controlled and source_fps <= 0:
+        raise RuntimeError(
+            "Controlled evaluation requires a valid source FPS. "
+            "Pass --eval-assume-fps <value> if the video container does not report one."
+        )
     if eval_controlled and not frame_log_path:
         frame_log_path = FRAME_LOG_FILE
     frame_rows = []
@@ -939,6 +1374,7 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
     frame_index = 0
     run_started_at = time.perf_counter()
     alarm_event_fieldnames = [
+        "run_id",
         "timestamp",
         "source",
         "event",
@@ -951,6 +1387,7 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
 
     def add_alarm_event(event, event_frame, event_time, event_ear):
         alarm_event_rows.append({
+            "run_id": run_id or "",
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "source": source_label,
             "event": event,
@@ -967,11 +1404,14 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
             if not ret:
                 break
 
+            loop_start = time.perf_counter()
             raw_frame = frame.copy()
             fh, fw = frame.shape[:2]
             timings = {}
             wall_seconds = time.perf_counter() - run_started_at
             time_seconds = frame_index / source_fps if source_fps > 0 else wall_seconds
+            pending_frame_row = None
+            break_after_frame = False
 
             # ① Grayscale
             t = time.perf_counter()
@@ -1025,6 +1465,7 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
             t = time.perf_counter()
             ear = 0.0
             landmarks_found = False
+            landmark_count = 0
             if facemesh_roi is not None:
                 x1, y1, x2, y2 = facemesh_roi
                 roi_bgr = raw_frame[y1:y2, x1:x2]
@@ -1039,6 +1480,7 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
                 if result.multi_face_landmarks:
                     landmarks_found = True
                     lms = result.multi_face_landmarks[0].landmark
+                    landmark_count = len(lms)
                     pts = np.array([
                         [int(lm.x * roi_w) + x1, int(lm.y * roi_h) + y1]
                         for lm in lms
@@ -1106,9 +1548,35 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
                     "face_gate_active": bool_field(facemesh_roi is not None),
                     "haar_box_reused": bool_field(reused_face_box),
                     "facemesh_ran": bool_field(facemesh_roi is not None),
-                    "landmarks_found": bool_field(landmarks_found),
+                    "landmarks_found": str(landmark_count if landmarks_found else 0),
                     "haar_miss_frames": str(haar_miss_frames),
                 }
+                if eval_controlled:
+                    label_segments = build_eval_segments(
+                        eval_open_seconds,
+                        eval_closed_seconds,
+                        time_seconds + eval_open_seconds + eval_closed_seconds + 1.0,
+                        eval_schedule,
+                    )
+                    label = label_controlled_frame(
+                        time_seconds,
+                        label_segments,
+                        eval_transition_buffer_frames,
+                        source_fps,
+                    )
+                    frame_row.update({
+                        "ground_truth": label["label"],
+                        "near_boundary": bool_field(label["near_boundary"]),
+                        "schedule_segment_index": label["segment_index"],
+                        "schedule_segment_start": (
+                            f"{label['segment_start']:.6f}"
+                            if label["segment_start"] is not None else ""
+                        ),
+                        "schedule_segment_duration": (
+                            f"{label['segment_duration']:.6f}"
+                            if label["segment_duration"] is not None else ""
+                        ),
+                    })
                 if facemesh_roi is not None:
                     x1, y1, x2, y2 = facemesh_roi
                     frame_row.update({
@@ -1126,8 +1594,7 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
                     })
                 for stage, ms in timings.items():
                     frame_row[performance_stage_column(stage)] = f"{ms:.6f}"
-                frame_rows.append(frame_row)
-            frame_index += 1
+                pending_frame_row = frame_row
 
             draw_overlay(
                 frame, ear, drowsy, frame_counter, timings,
@@ -1139,7 +1606,7 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
                     quit_requested = True
-                    break
+                    break_after_frame = True
                 if is_calibrating and key in (ord("c"), 27):
                     is_calibrating = False
                     calibration_ears.clear()
@@ -1149,6 +1616,17 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
                         "[INFO] Calibration cancelled; "
                         f"using default threshold {current_threshold:.3f}"
                     )
+
+            total_loop_ms = (time.perf_counter() - loop_start) * 1000.0
+            loop_timings.append(total_loop_ms)
+            if pending_frame_row is not None:
+                pipeline_ms = sum(timings.values())
+                pending_frame_row["total_loop_ms"] = f"{total_loop_ms:.6f}"
+                pending_frame_row["overhead_ms"] = f"{max(0.0, total_loop_ms - pipeline_ms):.6f}"
+                frame_rows.append(pending_frame_row)
+            frame_index += 1
+            if break_after_frame:
+                break
 
     finally:
         face_mesh.close()
@@ -1168,6 +1646,13 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
             }
             total_mean_latency = sum(mean_timings.values())
             mean_fps = 1000.0 / total_mean_latency if total_mean_latency > 0 else 0
+            total_loop_mean_ms = (
+                sum(loop_timings) / len(loop_timings) if loop_timings else None
+            )
+            overhead_mean_ms = (
+                max(0.0, total_loop_mean_ms - total_mean_latency)
+                if total_loop_mean_ms is not None else None
+            )
 
             # Print an elegant markdown text summary in the console terminal
             print("\n" + "="*55)
@@ -1178,6 +1663,9 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
                 print(f"{stage:<25}: {ms:>6.2f} ms ({percentage:>5.1f}%)")
             print("-"*55)
             print(f"Total Pipeline Latency   : {total_mean_latency:.2f} ms")
+            if total_loop_mean_ms is not None:
+                print(f"Total Loop Time          : {total_loop_mean_ms:.2f} ms")
+                print(f"Uninstrumented Overhead  : {overhead_mean_ms:.2f} ms")
             print(f"Average System Throughput: {mean_fps:.1f} FPS")
             print("="*55)
 
@@ -1187,6 +1675,9 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
                 total_mean_latency,
                 mean_fps,
                 source_label,
+                run_id=run_id,
+                total_loop_mean_ms=total_loop_mean_ms,
+                overhead_mean_ms=overhead_mean_ms,
             )
             print_performance_log_table(performance_rows, stage_names)
 
@@ -1241,7 +1732,7 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (35, 35, 35), 1, cv2.LINE_AA
                     )
 
-                report_path = os.path.join(os.path.dirname(__file__), "pipeline_performance_benchmark.png")
+                report_path = str(OUTPUT_DIR / "pipeline_performance_benchmark.png")
                 cv2.imwrite(report_path, chart)
                 print(f"[INFO] Performance chart successfully generated and exported as '{report_path}'!")
             except Exception as e:
@@ -1260,6 +1751,14 @@ def run(cap, face_cascade, alarm, ear_threshold=EAR_THRESHOLD,
                 frame_rows,
                 eval_open_seconds,
                 eval_closed_seconds,
+                transition_buffer_frames=eval_transition_buffer_frames,
+                bootstrap_iterations=eval_bootstrap_iterations,
+                bootstrap_seed=eval_bootstrap_seed,
+                source_fps=source_fps,
+                explicit_schedule=eval_schedule,
+                schedule_sidecar_path=eval_schedule_path,
+                eval_tag=eval_tag,
+                run_id=run_id,
             )
             if eval_output_path:
                 write_json(eval_output_path, summary)
@@ -1311,7 +1810,18 @@ def main():
     ap.add_argument("--no-alarm-log", action="store_true",
                     help="Disable alarm event CSV logging")
     ap.add_argument("--eval-controlled", action="store_true",
-                    help="Score the run against the record_test.py open/closed schedule")
+                    help="Score the run against the validation recording schedule")
+    ap.add_argument("--eval-transition-buffer-frames", type=int,
+                    default=EVAL_TRANSITION_BUFFER_FRAMES,
+                    help="Exclude this many frames around controlled schedule transitions "
+                         f"(default: {EVAL_TRANSITION_BUFFER_FRAMES})")
+    ap.add_argument("--eval-bootstrap-iterations", type=int,
+                    default=EVAL_BOOTSTRAP_ITERATIONS,
+                    help=f"Bootstrap samples for metric confidence intervals (default: {EVAL_BOOTSTRAP_ITERATIONS})")
+    ap.add_argument("--eval-bootstrap-seed", type=int, default=EVAL_BOOTSTRAP_SEED,
+                    help=f"Seed for bootstrap confidence intervals (default: {EVAL_BOOTSTRAP_SEED})")
+    ap.add_argument("--eval-tag", default="validation",
+                    help="Evaluation tag for output filenames and summary metadata (default: validation)")
     ap.add_argument("--eval-open-seconds", type=float, default=CONTROLLED_OPEN_SECONDS,
                     help=f"Open-eye seconds per controlled cycle (default: {CONTROLLED_OPEN_SECONDS})")
     ap.add_argument("--eval-closed-seconds", type=float, default=CONTROLLED_CLOSED_SECONDS,
@@ -1320,6 +1830,8 @@ def main():
                     help=f"Write controlled evaluation summary JSON here (default: {CONTROLLED_EVAL_FILE})")
     ap.add_argument("--eval-expected-seconds", type=float, default=CONTROLLED_EXPECTED_SECONDS,
                     help=f"Expected controlled recording duration (default: {CONTROLLED_EXPECTED_SECONDS})")
+    ap.add_argument("--eval-assume-fps", type=float, default=None,
+                    help="Override source FPS for controlled evaluation when the container metadata is unreliable")
     args = ap.parse_args()
     if args.frames < 1:
         sys.exit("[ERROR] --frames must be at least 1")
@@ -1341,6 +1853,12 @@ def main():
         sys.exit("[ERROR] --eval-closed-seconds must be greater than 0")
     if args.eval_expected_seconds <= 0:
         sys.exit("[ERROR] --eval-expected-seconds must be greater than 0")
+    if args.eval_transition_buffer_frames < 0:
+        sys.exit("[ERROR] --eval-transition-buffer-frames must be at least 0")
+    if args.eval_bootstrap_iterations < 0:
+        sys.exit("[ERROR] --eval-bootstrap-iterations must be at least 0")
+    if args.eval_assume_fps is not None and args.eval_assume_fps <= 0:
+        sys.exit("[ERROR] --eval-assume-fps must be greater than 0")
 
     import cv2
 
@@ -1353,7 +1871,17 @@ def main():
         else:
             input_value = choose_startup_source(cv2, scan_limit=args.camera_scan_limit)
 
+    eval_schedule_data = None
+    if args.eval_controlled:
+        try:
+            eval_schedule_data = load_controlled_schedule_sidecar(input_value)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            sys.exit(f"[ERROR] Could not load controlled schedule sidecar: {exc}")
+        if eval_schedule_data:
+            print(f"[INFO] Using controlled schedule sidecar: {eval_schedule_data['path']}")
+
     source = parse_video_source(input_value)
+    run_id = make_run_id()
 
     print("[INFO] Initializing alarm...")
     alarm, audio_enabled = init_alarm(enabled=not args.no_audio)
@@ -1370,12 +1898,27 @@ def main():
     if not cap.isOpened():
         sys.exit(f"[ERROR] Cannot open: '{source}'")
     source_fps = safe_float(cap.get(cv2.CAP_PROP_FPS))
+    if args.eval_controlled:
+        if args.eval_assume_fps is not None:
+            source_fps = args.eval_assume_fps
+            print(f"[INFO] Using controlled-eval FPS override: {source_fps:.3f}")
+        else:
+            try:
+                source_fps = validate_controlled_source_fps(source_fps)
+            except RuntimeError as exc:
+                sys.exit(f"[ERROR] {exc}")
     frame_log_path = args.frame_log
     if args.eval_controlled and not frame_log_path:
         frame_log_path = FRAME_LOG_FILE
+    if args.eval_controlled:
+        frame_log_path = tagged_output_path(frame_log_path, args.eval_tag)
+        args.eval_output = tagged_output_path(args.eval_output, args.eval_tag)
     alarm_event_log_path = None if args.no_alarm_log else args.alarm_log
     if args.eval_controlled:
-        warn_if_controlled_input_is_short(cap, args.eval_expected_seconds)
+        expected_seconds = args.eval_expected_seconds
+        if eval_schedule_data:
+            expected_seconds = eval_schedule_data["total_seconds"]
+        warn_if_controlled_input_is_short(cap, expected_seconds)
 
     print("[INFO] Drowsy Driver Detection started | press 'q' to quit")
     if args.calibrate:
@@ -1404,6 +1947,13 @@ def main():
             eval_open_seconds=args.eval_open_seconds,
             eval_closed_seconds=args.eval_closed_seconds,
             eval_output_path=args.eval_output,
+            eval_transition_buffer_frames=args.eval_transition_buffer_frames,
+            eval_bootstrap_iterations=args.eval_bootstrap_iterations,
+            eval_bootstrap_seed=args.eval_bootstrap_seed,
+            eval_schedule=eval_schedule_data["schedule"] if eval_schedule_data else None,
+            eval_schedule_path=eval_schedule_data["path"] if eval_schedule_data else None,
+            eval_tag=args.eval_tag,
+            run_id=run_id,
         )
     except RuntimeError as exc:
         sys.exit(f"[ERROR] {exc}")
